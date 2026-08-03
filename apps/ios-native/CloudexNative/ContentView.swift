@@ -67,6 +67,9 @@ struct ContentView: View {
             .animation(.easeInOut(duration: 0.18), value: isAtChatBottom)
         }
         .ignoresSafeArea(.keyboard, edges: .top)
+        .onChange(of: userMessageSignature, initial: true) { _, _ in
+            messageJumpSnapshot = currentUserMessages
+        }
         .task {
             await viewModel.start()
             await viewModel.loadModelsIfNeeded()
@@ -122,54 +125,14 @@ struct ContentView: View {
             .shadow(color: .black.opacity(0.09), radius: 12, y: 5)
             .accessibilityLabel("打开项目菜单")
 
-            Menu {
-                if messageJumpSnapshot.isEmpty {
-                    Text("暂无发送信息")
-                } else {
-                    ForEach(messageJumpSnapshot) { message in
-                        Button {
-                            scrollTargetMessageID = message.id
-                        } label: {
-                            Text(oneLineMessageText(message.text))
-                                .lineLimit(1)
-                        }
-                        .id("jump-menu-\(message.id)")
-                    }
-                }
-            } label: {
-                VStack(spacing: 2) {
-                    Text(viewModel.navigationTitle)
-                        .font(.headline)
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                    HStack(spacing: 5) {
-                        Circle()
-                            .fill(viewModel.isConnected ? Color.green : Color.red)
-                            .frame(width: 7, height: 7)
-                        Text(viewModel.projectTitle)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.horizontal, 15)
-                .padding(.vertical, 8)
-                .contentShape(Capsule())
-                .liquidGlass(in: Capsule(), interactive: true)
-                .shadow(color: .black.opacity(0.08), radius: 14, y: 5)
-            }
-            .onAppear {
-                messageJumpSnapshot = viewModel.renderedMessages.filter { $0.role == .user }
-            }
-            .onChange(of: viewModel.selectedThreadID) { _, _ in
-                messageJumpSnapshot = viewModel.renderedMessages.filter { $0.role == .user }
-            }
-            .tint(.primary)
-            .popover(isPresented: $showingMessageJumpMenu, arrowEdge: .top) {
-                messageJumpMenu
-                    .presentationCompactAdaptation(.popover)
-            }
+            MessageJumpSystemMenu(
+                messages: messageJumpSnapshot,
+                title: viewModel.navigationTitle,
+                projectTitle: viewModel.projectTitle,
+                isConnected: viewModel.isConnected,
+                onSelect: { scrollTargetMessageID = $0 }
+            )
+            .equatable()
 
             Button { showingSettings = true } label: {
                 Image(systemName: "gearshape")
@@ -278,11 +241,12 @@ struct ContentView: View {
         .frame(maxHeight: .infinity)
     }
 
-    private func oneLineMessageText(_ text: String) -> String {
-        let normalized = text
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return normalized.isEmpty ? "（空消息）" : normalized
+    private var currentUserMessages: [ChatMessage] {
+        viewModel.renderedMessages.filter { $0.role == .user }
+    }
+
+    private var userMessageSignature: [String] {
+        currentUserMessages.map { "\($0.id):\($0.text)" }
     }
 
     @ViewBuilder
@@ -1237,6 +1201,69 @@ private struct ApprovalBubble: View {
             .background(color.opacity(0.12), in: Capsule())
             .contentShape(Capsule())
             .buttonStyle(.plain)
+    }
+}
+
+private struct MessageJumpSystemMenu: View, Equatable {
+    let messages: [ChatMessage]
+    let title: String
+    let projectTitle: String
+    let isConnected: Bool
+    let onSelect: (String) -> Void
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.messages == rhs.messages &&
+        lhs.title == rhs.title &&
+        lhs.projectTitle == rhs.projectTitle &&
+        lhs.isConnected == rhs.isConnected
+    }
+
+    var body: some View {
+        Menu {
+            if messages.isEmpty {
+                Text("暂无发送信息")
+            } else {
+                ForEach(messages) { message in
+                    Button {
+                        onSelect(message.id)
+                    } label: {
+                        Text(oneLineText(message.text))
+                            .lineLimit(1)
+                    }
+                    .id("jump-menu-\(message.id)")
+                }
+            }
+        } label: {
+            VStack(spacing: 2) {
+                Text(title)
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(isConnected ? Color.green : Color.red)
+                        .frame(width: 7, height: 7)
+                    Text(projectTitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 15)
+            .padding(.vertical, 8)
+            .contentShape(Capsule())
+            .liquidGlass(in: Capsule(), interactive: true)
+            .shadow(color: .black.opacity(0.08), radius: 14, y: 5)
+        }
+        .tint(.primary)
+    }
+
+    private func oneLineText(_ text: String) -> String {
+        let normalized = text
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? "（空消息）" : normalized
     }
 }
 

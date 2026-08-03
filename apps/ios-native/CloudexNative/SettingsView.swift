@@ -49,6 +49,48 @@ struct SettingsView: View {
                         .autocorrectionDisabled()
                 }
 
+                Section("最近连接") {
+                    if viewModel.connectionHistory.isEmpty {
+                        Text("保存设置后会在这里显示连接记录")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(viewModel.connectionHistory) { item in
+                            Button {
+                                Task {
+                                    await viewModel.switchToConnection(item)
+                                    lanServerURL = viewModel.lanServerURL
+                                    tailscaleServerURL = viewModel.tailscaleServerURL
+                                    connectionMode = viewModel.connectionMode
+                                    token = viewModel.authToken
+                                }
+                            } label: {
+                                HStack(spacing: 10) {
+                                    Image(systemName: "arrow.triangle.2.circlepath")
+                                        .foregroundStyle(.secondary)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(item.serverURL)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        Text("Token (item.maskedToken) · \(item.connectionMode.title)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer(minLength: 0)
+                                    if viewModel.serverURL == item.serverURL && viewModel.authToken == item.token {
+                                        Image(systemName: "checkmark")
+                                            .foregroundStyle(.tint)
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .onDelete { offsets in
+                            viewModel.removeConnectionHistory(at: offsets)
+                        }
+                    }
+                }
+
                 Section("Tailscale") {
                     Text("电脑和 iPhone 需登录同一 Tailnet，并在手机上开启 Tailscale VPN。自动模式会先尝试局域网，失败后切换到 Tailscale。")
                         .font(.footnote)

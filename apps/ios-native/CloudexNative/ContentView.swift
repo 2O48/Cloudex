@@ -1,9 +1,10 @@
 import SwiftUI
 import gitdiff
+import UIKit
 
 struct ContentView: View {
     @EnvironmentObject private var viewModel: AppViewModel
-    @State private var showingSidebar = false
+    let expectedThreadID: String?
     @State private var showingSettings = false
     @State private var showingFilePicker = false
     @State private var isAtChatBottom = true
@@ -12,7 +13,14 @@ struct ContentView: View {
     @State private var floatingCollapseVisible = false
     @State private var scrollTargetMessageID: String?
     @State private var suppressAutomaticScroll = false
-    @State private var messageJumpSnapshot: [ChatMessage] = []
+    @State private var messageJumpSnapshot: [MessageJumpItem] = []
+    @State private var showingTokenUsage = false
+    @FocusState private var composerFocused: Bool
+    @State private var keyboardHeight: CGFloat = 0
+
+    init(expectedThreadID: String? = nil) {
+        self.expectedThreadID = expectedThreadID
+    }
 
     var body: some View {
         ZStack {
@@ -43,11 +51,9 @@ struct ContentView: View {
                 .zIndex(10)
             }
             VStack(spacing: 0) {
-                header
                 Spacer(minLength: 0)
                 if !isAtChatBottom {
                     Button {
-                        isAtChatBottom = true
                         scrollToBottomRequest += 1
                     } label: {
                         Image(systemName: "arrow.down")
@@ -59,6 +65,10 @@ struct ContentView: View {
                     .liquidGlass(in: Circle(), interactive: true)
                     .shadow(color: .black.opacity(0.1), radius: 10, y: 4)
                     .padding(.bottom, 6)
+                    // The composer extends into the bottom safe area when
+                    // the keyboard is hidden; keep this button aligned with
+                    // the composer's visible bottom edge.
+                    .offset(y: keyboardHeight > 0 ? 0 : 7)
                     .transition(.scale.combined(with: .opacity))
                     .accessibilityLabel("滚动到最新消息")
                 }
@@ -67,16 +77,26 @@ struct ContentView: View {
             .animation(.easeInOut(duration: 0.18), value: isAtChatBottom)
         }
         .ignoresSafeArea(.keyboard, edges: .top)
-        .onChange(of: userMessageSignature, initial: true) { _, _ in
-            messageJumpSnapshot = currentUserMessages
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                MessageJumpSystemMenu(
+                    messages: messageJumpSnapshot,
+                    title: viewModel.navigationTitle,
+                    projectTitle: viewModel.projectTitle,
+                    isConnected: viewModel.isConnected,
+                    onSelect: { scrollTargetMessageID = $0.id }
+                )
+                .equatable()
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { showingSettings = true } label: {
+                    Image(systemName: "gearshape")
+                }
+                .accessibilityLabel("打开设置")
+            }
         }
-        .task {
-            await viewModel.start()
-            await viewModel.loadModelsIfNeeded()
-        }
-        .sheet(isPresented: $showingSidebar) {
-            SidebarView(isPresented: $showingSidebar)
-                .environmentObject(viewModel)
+        .onChange(of: viewModel.messageIndex, initial: true) { _, items in
+            messageJumpSnapshot = items.map(MessageJumpItem.init)
         }
         .sheet(isPresented: $showingSettings) {
             SettingsView(isPresented: $showingSettings)
@@ -90,6 +110,17 @@ struct ContentView: View {
                 viewModel.attach(file)
             }
             .environmentObject(viewModel)
+        }
+        .sheet(isPresented: $showingTokenUsage) {
+            TokenUsageSheet(usage: viewModel.selectedThread?.usage)
+                .presentationDetents([.medium])
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
+            guard let value = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue else { return }
+            keyboardHeight = max(0, UIScreen.main.bounds.maxY - value.cgRectValue.minY)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            keyboardHeight = 0
         }
     }
 
@@ -112,49 +143,19 @@ struct ContentView: View {
         .ignoresSafeArea()
     }
 
-    private var header: some View {
-        HStack(spacing: 12) {
-            Button { showingSidebar = true } label: {
-                Image(systemName: "line.3.horizontal")
-                    .font(.body.weight(.semibold))
-                    .frame(width: 44, height: 44)
-                    .contentShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .liquidGlass(in: Circle(), interactive: true)
-            .shadow(color: .black.opacity(0.09), radius: 12, y: 5)
-            .accessibilityLabel("打开项目菜单")
-
-            MessageJumpSystemMenu(
-                messages: messageJumpSnapshot,
-                title: viewModel.navigationTitle,
-                projectTitle: viewModel.projectTitle,
-                isConnected: viewModel.isConnected,
-                onSelect: { scrollTargetMessageID = $0 }
-            )
-            .equatable()
-
-            Button { showingSettings = true } label: {
-                Image(systemName: "gearshape")
-                    .font(.body.weight(.semibold))
-                    .frame(width: 44, height: 44)
-                    .contentShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .liquidGlass(in: Circle(), interactive: true)
-            .shadow(color: .black.opacity(0.09), radius: 12, y: 5)
-            .accessibilityLabel("打开设置")
-        }
-        .padding(.horizontal, 14)
-        .padding(.top, 8)
-    }
-
     private var chat: some View {
         ScrollViewReader { proxy in
             trackedChatScrollView {
-                let messages = viewModel.renderedMessages
+                let isNewChat = expectedThreadID?.hasPrefix("new-") == true
+                let isReady = isNewChat || expectedThreadID == viewModel.selectedThreadID
+                let messages = isReady ? viewModel.renderedMessages : []
                 LazyVStack(spacing: 12) {
-                    if viewModel.selectedThread == nil && messages.isEmpty {
+                    if !isReady {
+                        ProgressView("正在打开对话…")
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 120)
+                    }
+                    if isReady && viewModel.selectedThread == nil && messages.isEmpty {
                         VStack(spacing: 10) {
                             Spacer(minLength: 130)
                             Text(viewModel.isCreatingNew ? "开始新对话" : "选择一个对话")
@@ -208,11 +209,17 @@ struct ContentView: View {
                     Color.clear.frame(height: 1).id("chat-bottom")
                 }
                 .padding(.horizontal, 16)
-                .padding(.top, 78)
-                .padding(.bottom, viewModel.attachedFiles.isEmpty ? 104 : 148)
+                .padding(.top, 16)
+                // Keep the scroll target above the composer, its model/effort
+                // row, and the optional attachment row.
+                .padding(.bottom, viewModel.attachedFiles.isEmpty ? 144 : 188)
             }
-            .onAppear { scrollToBottom(proxy, animated: false) }
-            .onChange(of: viewModel.selectedThreadID) { _, _ in scrollToBottom(proxy, animated: false) }
+            .onAppear {
+                scrollToBottom(proxy, animated: false)
+            }
+            .onChange(of: viewModel.selectedThreadID) { _, _ in
+                scrollToBottom(proxy, animated: false)
+            }
             .onChange(of: viewModel.renderedMessages.count) { _, _ in
                 if isAtChatBottom && !suppressAutomaticScroll { scrollToBottom(proxy, animated: false) }
             }
@@ -241,14 +248,6 @@ struct ContentView: View {
         .frame(maxHeight: .infinity)
     }
 
-    private var currentUserMessages: [ChatMessage] {
-        viewModel.renderedMessages.filter { $0.role == .user }
-    }
-
-    private var userMessageSignature: [String] {
-        currentUserMessages.map { "\($0.id):\($0.text)" }
-    }
-
     @ViewBuilder
     private func trackedChatScrollView<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         if #available(iOS 18.0, *) {
@@ -259,7 +258,9 @@ struct ContentView: View {
             .onScrollGeometryChange(for: Bool.self) { geometry in
                 let visibleBottom = geometry.contentOffset.y + geometry.containerSize.height
                 let distanceToBottom = geometry.contentSize.height - visibleBottom
-                return geometry.contentSize.height <= geometry.containerSize.height || distanceToBottom <= 80
+                // Allow a small amount of movement at the bottom without
+                // treating the user as having intentionally scrolled away.
+                return geometry.contentSize.height <= geometry.containerSize.height || distanceToBottom <= 24
             } action: { _, atBottom in
                 isAtChatBottom = atBottom
             }
@@ -364,6 +365,19 @@ struct ContentView: View {
                 .accessibilityLabel("切换用量")
 
                 Spacer(minLength: 0)
+
+                Button {
+                    showingTokenUsage = true
+                } label: {
+                    Text(contextRemainingLabel)
+                        .font(.caption2.weight(.semibold))
+                        .lineLimit(1)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 6)
+                }
+                .buttonStyle(.plain)
+                .liquidGlass(in: Capsule(), interactive: true)
+                .accessibilityLabel("查看本轮 Token 使用量")
             }
             .padding(.horizontal, 20)
 
@@ -388,6 +402,7 @@ struct ContentView: View {
                         .scrollContentBackground(.hidden)
                         .frame(minHeight: 38, maxHeight: 110)
                         .fixedSize(horizontal: false, vertical: true)
+                        .focused($composerFocused)
                 }
                 .padding(.horizontal, 3)
 
@@ -420,10 +435,11 @@ struct ContentView: View {
                 }
             }
             .padding(8)
-            .liquidGlass(in: RoundedRectangle(cornerRadius: 25, style: .continuous))
+            .liquidGlass(in: RoundedRectangle(cornerRadius: 28, style: .continuous))
             .shadow(color: .black.opacity(0.12), radius: 18, y: 8)
-            .padding(.horizontal, 12)
-            .padding(.bottom, 10)
+            .padding(.horizontal, 24)
+            .padding(.top, 10)
+            .padding(.bottom, keyboardHeight > 0 ? 18 : -7)
         }
     }
 
@@ -434,7 +450,6 @@ struct ContentView: View {
             } else {
                 proxy.scrollTo("chat-bottom", anchor: .bottom)
             }
-            isAtChatBottom = true
         }
     }
 
@@ -444,6 +459,61 @@ struct ContentView: View {
         if thread.status?.type == "idle" { return "已完成" }
         if thread.status?.type == "notLoaded" { return "未加载" }
         return thread.status?.type ?? "未知状态"
+    }
+
+    private var contextRemainingLabel: String {
+        guard let usage = viewModel.selectedThread?.usage,
+              let window = usage.modelContextWindow,
+              let used = usage.last?.totalTokens else { return "上下文" }
+        let remaining = max(0, window - used)
+        let percent = Int((Double(remaining) / Double(max(1, window)) * 100).rounded())
+        return "余 \(percent)%"
+    }
+}
+
+private struct TokenUsageSheet: View {
+    let usage: CloudexUsage?
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let last = usage?.last {
+                    Section("本轮对话") {
+                        usageRow("输入 Token", value: last.inputTokens)
+                        usageRow("缓存输入", value: last.cachedInputTokens)
+                        usageRow("输出 Token", value: last.outputTokens)
+                        usageRow("推理输出", value: last.reasoningOutputTokens)
+                        usageRow("合计", value: last.totalTokens)
+                    }
+                }
+                if let total = usage?.total {
+                    Section("整段对话累计") {
+                        usageRow("输入 Token", value: total.inputTokens)
+                        usageRow("输出 Token", value: total.outputTokens)
+                        usageRow("合计", value: total.totalTokens)
+                    }
+                }
+                if let window = usage?.modelContextWindow {
+                    Section("上下文窗口") {
+                        usageRow("窗口大小", value: window)
+                        let used = usage?.last?.totalTokens ?? 0
+                        usageRow("本轮剩余", value: max(0, window - used))
+                    }
+                }
+                if usage?.last == nil && usage?.total == nil {
+                    ContentUnavailableView("暂无 Token 数据", systemImage: "chart.bar.xaxis")
+                }
+            }
+            .navigationTitle("Token 使用量")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+
+    @ViewBuilder
+    private func usageRow(_ title: String, value: Int?) -> some View {
+        if let value {
+            LabeledContent(title, value: "\(value.formatted())")
+        }
     }
 }
 
@@ -524,6 +594,7 @@ private struct MessageBubble: View {
 }
 
 private struct ProcessSummaryBubble: View {
+    @EnvironmentObject private var viewModel: AppViewModel
     let message: ChatMessage
     @Binding var collapseRequest: Int
     let onFloatingStateChange: (Bool) -> Void
@@ -532,19 +603,37 @@ private struct ProcessSummaryBubble: View {
     @State private var expandedContentHeight: CGFloat = 0
     @State private var collapseButtonVisible = true
     @State private var bubbleVisible = true
+    @State private var loadingDetails = false
 
     var body: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 8) {
                 Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        expanded.toggle()
-                        if !expanded { expansionGeneration += 1 }
+                    if expanded {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            expanded = false
+                            expansionGeneration += 1
+                        }
+                    } else if message.processDetailsLoaded {
+                        withAnimation(.easeInOut(duration: 0.2)) { expanded = true }
+                    } else if let turnID = message.sourceTurnID, !loadingDetails {
+                        loadingDetails = true
+                        Task {
+                            let loaded = await viewModel.loadTurnDetails(turnID: turnID)
+                            loadingDetails = false
+                            if loaded {
+                                withAnimation(.easeInOut(duration: 0.2)) { expanded = true }
+                            }
+                        }
                     }
                 } label: {
                     HStack(spacing: 8) {
-                        Image(systemName: expanded ? "chevron.down.circle.fill" : "chevron.right.circle.fill")
-                            .foregroundStyle(.secondary)
+                        if loadingDetails {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: expanded ? "chevron.down.circle.fill" : "chevron.right.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
                         MarkdownText(text: message.text)
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.secondary)
@@ -720,21 +809,23 @@ private struct SystemTimelineBubble: View {
 
 private struct MarkdownText: View {
     let text: String
-    @State private var rendered: AttributedString
-
-    init(text: String) {
-        self.text = text
-        _rendered = State(initialValue: MarkdownText.parse(text))
-    }
 
     var body: some View {
-        Text(rendered)
-            .onChange(of: text) { _, newValue in
-                rendered = MarkdownText.parse(newValue)
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(Array(text.replacingOccurrences(of: "\r\n", with: "\n").split(separator: "\n", omittingEmptySubsequences: false).enumerated()), id: \.offset) { _, line in
+                let value = String(line)
+                if value.isEmpty {
+                    Color.clear.frame(height: 5)
+                } else {
+                    Text(Self.parseLine(value))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
+        }
+        .fixedSize(horizontal: false, vertical: true)
     }
 
-    private static func parse(_ text: String) -> AttributedString {
+    private static func parseLine(_ text: String) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
         return (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
     }
@@ -1205,11 +1296,11 @@ private struct ApprovalBubble: View {
 }
 
 private struct MessageJumpSystemMenu: View, Equatable {
-    let messages: [ChatMessage]
+    let messages: [MessageJumpItem]
     let title: String
     let projectTitle: String
     let isConnected: Bool
-    let onSelect: (String) -> Void
+    let onSelect: (MessageJumpItem) -> Void
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.messages == rhs.messages &&
@@ -1225,20 +1316,21 @@ private struct MessageJumpSystemMenu: View, Equatable {
             } else {
                 ForEach(messages) { message in
                     Button {
-                        onSelect(message.id)
+                        onSelect(message)
                     } label: {
-                        Text(oneLineText(message.text))
+                        Text("\(message.roleTitle) · \(message.text)")
                             .lineLimit(1)
                     }
                     .id("jump-menu-\(message.id)")
                 }
             }
         } label: {
-            VStack(spacing: 2) {
+            VStack(spacing: 0) {
                 Text(title)
-                    .font(.headline)
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
+                    .truncationMode(.tail)
                 HStack(spacing: 5) {
                     Circle()
                         .fill(isConnected ? Color.green : Color.red)
@@ -1249,21 +1341,33 @@ private struct MessageJumpSystemMenu: View, Equatable {
                         .lineLimit(1)
                 }
             }
-            .frame(maxWidth: .infinity)
+            // Keep the glass capsule below the navigation bar's clipping edges.
+            // Menu presentation/dismissal briefly re-lays out the principal
+            // item, and a capsule at the full 44pt bar height gets cropped.
+            .frame(maxWidth: 190)
+            .frame(height: 36)
             .padding(.horizontal, 15)
-            .padding(.vertical, 8)
             .contentShape(Capsule())
             .liquidGlass(in: Capsule(), interactive: true)
             .shadow(color: .black.opacity(0.08), radius: 14, y: 5)
+            .padding(.vertical, 4)
         }
         .tint(.primary)
     }
 
-    private func oneLineText(_ text: String) -> String {
-        let normalized = text
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return normalized.isEmpty ? "（空消息）" : normalized
+}
+
+private struct MessageJumpItem: Identifiable, Equatable {
+    let id: String
+    let turnID: String
+    let roleTitle: String
+    let text: String
+
+    init(item: MessageIndexItem) {
+        id = item.id
+        turnID = item.turnId
+        roleTitle = item.role == "user" ? "你" : "Codex"
+        text = item.text.isEmpty ? "（空消息）" : item.text
     }
 }
 

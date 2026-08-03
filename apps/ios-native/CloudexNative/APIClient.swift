@@ -42,6 +42,13 @@ struct APIClient {
         return "/api/threads/\(encoded)" + (action.map { "/\($0)" } ?? "")
     }
 
+    func threadTurnPath(_ threadID: String, turnID: String) -> String {
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/")
+        let encodedTurnID = turnID.addingPercentEncoding(withAllowedCharacters: allowed) ?? turnID
+        return threadPath(threadID, action: "turns/\(encodedTurnID)")
+    }
+
     func approvalPath(_ approvalID: String) -> String {
         var allowed = CharacterSet.urlPathAllowed
         allowed.remove(charactersIn: "/")

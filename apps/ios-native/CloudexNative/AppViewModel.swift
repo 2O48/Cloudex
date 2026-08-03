@@ -27,9 +27,11 @@ final class AppViewModel: ObservableObject {
     @Published var attachedFiles: [RemoteFileEntry] = []
     @Published var pendingApprovals: [ApprovalRequest] = []
     @Published var systemMessages: [ChatMessage] = [] { didSet { rebuildRenderedMessages() } }
+    @Published var messageIndex: [MessageIndexItem] = []
     @Published var notifyApprovals: Bool
     @Published var notifyTaskSuccess: Bool
     @Published var notifyTaskFailure: Bool
+    @Published private(set) var connectionHistory: [ConnectionHistoryItem] = []
 
     private let globalSSE = SSEClient()
     private let threadSSE = SSEClient()
@@ -43,6 +45,8 @@ final class AppViewModel: ObservableObject {
     private var lastThreadEventID = 0
     private var detailLoadGeneration = 0
     private var liveMessageTurnIDs: [String: String] = [:]
+    private var activeTurnNotificationKeys: [String: String] = [:]
+    private var sentTaskResultNotificationKeys = Set<String>()
 
     init() {
         let defaults = UserDefaults.standard
@@ -80,6 +84,7 @@ final class AppViewModel: ObservableObject {
         defaults.set(connectionMode.rawValue, forKey: "cloudex.connectionMode")
         defaults.set(authToken, forKey: "cloudex.authToken")
         projects = conversationCache.loadProjects() ?? []
+        connectionHistory = Self.loadConnectionHistory(defaults: defaults)
         rebuildRenderedMessages()
     }
 
@@ -124,11 +129,16 @@ final class AppViewModel: ObservableObject {
         renderedMessages
     }
 
+    private func isTurnInProgress(_ turn: CloudexTurn) -> Bool {
+        guard let status = turn.status?.lowercased() else { return liveRunning }
+        return ["inprogress", "in_progress", "active", "running"].contains(status)
+    }
+
     private func buildMessages() -> [ChatMessage] {
         var result: [ChatMessage] = []
         for turn in detail?.turns ?? [] {
             let items = turn.items ?? []
-            let shouldFoldProcess = turn.status != nil && turn.status != "inProgress"
+            let shouldFoldProcess = turn.status != nil && !isTurnInProgress(turn)
             let durationMessage = taskDurationMessage(for: turn)
             let compressedMessage = compressedMessage(for: turn)
             if shouldFoldProcess {
@@ -159,13 +169,16 @@ final class AppViewModel: ObservableObject {
                 if let durationMessage { processItems.append(durationMessage) }
                 processItems = mergeSemanticExecutionItems(processItems)
 
-                if !processItems.isEmpty {
+                if !processItems.isEmpty || (turn.processItemCount ?? 0) > 0 {
                     result.append(ChatMessage(
                         id: "\(turn.id)-process-summary",
                         role: .processSummary,
-                        text: processSummaryText(processItems),
+                        text: processSummaryText(processItems, totalCount: turn.processItemCount),
                         processItems: processItems,
-                        createdAt: processItems.compactMap(\.createdAt).min()
+                        createdAt: processItems.compactMap(\.createdAt).min(),
+                        sourceTurnID: turn.id,
+                        processItemCount: turn.processItemCount,
+                        processDetailsLoaded: turn.detailsLoaded ?? true
                     ))
                 }
                 if let finalMessage { result.append(finalMessage) }
@@ -175,6 +188,15 @@ final class AppViewModel: ObservableObject {
                         result.append(message)
                     }
                 }
+                // Keep the original live presentation for an active turn:
+                // each execution row and assistant bubble stays directly in
+                // the timeline. Only the command semantic classification is
+                // shared with the completed-turn process view.
+                let liveForTurn = liveMessages.filter { liveMessageTurnIDs[$0.id] == turn.id }
+                let existingMessageIDs = Set(result.map(\.id))
+                result.append(contentsOf: liveForTurn.filter {
+                    !existingMessageIDs.contains($0.id)
+                })
                 if let durationMessage { result.append(durationMessage) }
                 if let compressedMessage { result.append(compressedMessage) }
             }
@@ -196,12 +218,11 @@ final class AppViewModel: ObservableObject {
             ))
         }
         result.append(contentsOf: systemMessages.filter { $0.threadID == nil || $0.threadID == selectedThreadID })
-        result.append(contentsOf: liveMessages.filter { message in
-            guard message.role == .execution,
-                  let turnID = liveMessageTurnIDs[message.id],
-                  let turn = detail?.turns.first(where: { $0.id == turnID }) else { return true }
-            return turn.status == "inProgress"
-        })
+        // A new chat has no turn yet, so retain live messages until its first
+        // server snapshot arrives. Existing turns render live items above.
+        if detail?.turns.isEmpty == true {
+            result.append(contentsOf: liveMessages)
+        }
         return mergeSemanticExecutionItems(result).enumerated().sorted { lhs, rhs in
             switch (lhs.element.createdAt, rhs.element.createdAt) {
             case let (left?, right?):
@@ -317,17 +338,21 @@ final class AppViewModel: ObservableObject {
     }
 
     private func readTargets(from command: String) -> [String]? {
-        let first = firstCommandName(command)
-        guard ["sed", "cat", "head", "tail"].contains(first) else { return nil }
+        guard containsCommand(command, names: ["sed", "cat", "head", "tail"]) else { return nil }
         let targets = fileTargets(from: command)
         return targets.isEmpty ? ["files"] : targets
     }
 
     private func searchTargets(from command: String) -> [String]? {
-        let first = firstCommandName(command)
-        guard ["rg", "grep", "find", "fd"].contains(first) else { return nil }
+        guard containsCommand(command, names: ["rg", "grep", "find", "fd"]) else { return nil }
         let targets = fileTargets(from: command)
         return targets.isEmpty ? ["workspace"] : targets
+    }
+
+    private func containsCommand(_ command: String, names: [String]) -> Bool {
+        let escaped = names.map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|")
+        let pattern = "(?:^|[;&|()]\\s*|\\b)(?:" + escaped + ")(?:\\s|$)"
+        return command.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
     }
 
     private func firstCommandName(_ command: String) -> String {
@@ -480,7 +505,7 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func processSummaryText(_ items: [ChatMessage]) -> String {
+    private func processSummaryText(_ items: [ChatMessage], totalCount: Int? = nil) -> String {
         let read = items.filter { $0.role == .execution && $0.executionKind == "read" }.count
         let search = items.filter { $0.role == .execution && $0.executionKind == "search" }.count
         let explored = items.filter { $0.role == .execution && $0.executionKind == "explore" }.count
@@ -498,7 +523,7 @@ final class AppViewModel: ObservableObject {
         if messages > 0 { parts.append("消息 \(messages)") }
         if compressed > 0 { parts.append("Compressed \(compressed)") }
         if let taskSummary, !taskSummary.isEmpty { parts.append(taskSummary) }
-        return "查看过程（\(items.count)）" + (parts.isEmpty ? "" : " · \(parts.joined(separator: " · "))")
+        return "查看过程（\(totalCount ?? items.count)）" + (parts.isEmpty ? "" : " · \(parts.joined(separator: " · "))")
     }
 
     private func shouldHidePersistedLiveMessage(_ item: TurnItem, turnID: String) -> Bool {
@@ -539,10 +564,14 @@ final class AppViewModel: ObservableObject {
     }
 
     private func upsertLiveExecution(item: [String: Any], turnID: String?, status: String) {
-        guard let id = item["id"] as? String,
-              let command = item["command"] as? String,
-              !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        let execution = semanticExecution(command: command, activity: nil, status: status)
+        guard let id = item["id"] as? String else { return }
+        let activity = item["activity"] as? String
+        // Codex uses different payload shapes for shell exploration and file
+        // edits. Edits may not have a command at all, so do not discard them.
+        let command = (item["command"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? (item["path"] as? String)
+            ?? (activity == "edited" ? "files" : activity == "explored" ? "workspace" : "tool")
+        let execution = semanticExecution(command: command, activity: activity, status: status)
         let duration: String? = {
             guard let milliseconds = (item["durationMs"] as? NSNumber)?.doubleValue else { return nil }
             return DateFormatting.duration(fromMilliseconds: milliseconds)
@@ -564,6 +593,17 @@ final class AppViewModel: ObservableObject {
         } else {
             liveMessages.append(message)
         }
+    }
+
+    private func isLiveExecutionItem(_ item: [String: Any]) -> Bool {
+        let type = (item["type"] as? String ?? "").lowercased()
+        return type == "commandexecution"
+            || type.contains("commandexecution")
+            || type.contains("filechange")
+            || type.contains("toolcall")
+            || item["command"] != nil
+            || item["activity"] != nil
+            || item["diff"] != nil
     }
 
     private func clearLiveMessages() {
@@ -623,6 +663,7 @@ final class AppViewModel: ObservableObject {
         defaults.set(self.tailscaleServerURL, forKey: "cloudex.tailscaleServerURL")
         defaults.set(connectionMode.rawValue, forKey: "cloudex.connectionMode")
         defaults.set(authToken, forKey: "cloudex.authToken")
+        saveConnectionHistory(serverURL: serverURL, token: authToken, mode: connectionMode)
         globalSSE.stop()
         threadSSE.stop()
         streamsStarted = false
@@ -631,6 +672,42 @@ final class AppViewModel: ObservableObject {
         streamsStarted = true
         connectGlobalStream()
         if let selectedThreadID { connectThreadStream(threadID: selectedThreadID) }
+    }
+
+    func switchToConnection(_ item: ConnectionHistoryItem) async {
+        let lanURL = item.connectionMode == .tailscale ? lanServerURL : item.serverURL
+        let tailscaleURL = item.connectionMode == .tailscale ? item.serverURL : tailscaleServerURL
+        await applySettings(
+            lanServerURL: lanURL,
+            tailscaleServerURL: tailscaleURL,
+            connectionMode: item.connectionMode,
+            token: item.token
+        )
+    }
+
+    func removeConnectionHistory(at offsets: IndexSet) {
+        connectionHistory.remove(atOffsets: offsets)
+        if let data = try? JSONEncoder().encode(connectionHistory) {
+            UserDefaults.standard.set(data, forKey: "cloudex.connectionHistory")
+        }
+    }
+
+    private func saveConnectionHistory(serverURL: String, token: String, mode: ConnectionMode) {
+        let url = normalizedURL(serverURL)
+        guard !url.isEmpty, !token.isEmpty else { return }
+        var items = connectionHistory.filter { $0.serverURL != url || $0.token != token }
+        items.append(ConnectionHistoryItem(serverURL: url, token: token, connectionMode: mode))
+        items.sort { $0.lastUsedAt > $1.lastUsedAt }
+        connectionHistory = Array(items.prefix(12))
+        if let data = try? JSONEncoder().encode(connectionHistory) {
+            UserDefaults.standard.set(data, forKey: "cloudex.connectionHistory")
+        }
+    }
+
+    private static func loadConnectionHistory(defaults: UserDefaults) -> [ConnectionHistoryItem] {
+        guard let data = defaults.data(forKey: "cloudex.connectionHistory"),
+              let items = try? JSONDecoder().decode([ConnectionHistoryItem].self, from: data) else { return [] }
+        return items.sorted { $0.lastUsedAt > $1.lastUsedAt }
     }
 
     func refresh() async {
@@ -653,10 +730,7 @@ final class AppViewModel: ObservableObject {
                     connectGlobalStream()
                     if let selectedThreadID { connectThreadStream(threadID: selectedThreadID) }
                 }
-            if selectedThreadID == nil, !isCreatingNew, let first = allThreads.first {
-                await openThread(first, projectCWD: first.cwd)
-            }
-                return
+            return
             } catch {
                 lastError = error
             }
@@ -757,14 +831,24 @@ final class AppViewModel: ObservableObject {
         clearLiveMessages()
         localError = nil
         attachedFiles = []
-        if let cached = conversationCache.loadThreadDetail(threadID: thread.id) {
-            detail = cached
-            liveRunning = cached.thread.isActive
-        } else {
-            detail = ThreadDetail(thread: thread, turns: [])
-            liveRunning = thread.isActive
+        detail = ThreadDetail(thread: thread, turns: [])
+        liveRunning = thread.isActive
+        messageIndex = []
+        let cache = conversationCache
+        let cachedDetail = await Task.detached(priority: .userInitiated) {
+            cache.loadThreadDetail(threadID: thread.id)
+        }.value
+        guard selectedThreadID == thread.id else { return }
+        if let cachedDetail {
+            detail = cachedDetail
+            liveRunning = cachedDetail.thread.isActive
         }
-        await loadThread(thread.id, force: true)
+        let cachedIndex = await Task.detached(priority: .utility) {
+            cache.loadMessageIndex(threadID: thread.id)
+        }.value
+        guard selectedThreadID == thread.id else { return }
+        if let cachedIndex { messageIndex = cachedIndex }
+        await loadThread(thread.id, force: true, replacingHistory: true)
         connectThreadStream(threadID: thread.id)
         startPolling(threadID: thread.id)
     }
@@ -779,19 +863,30 @@ final class AppViewModel: ObservableObject {
         localError = nil
         attachedFiles = []
         isCreatingNew = true
+        messageIndex = []
         threadSSE.stop()
         pollTask?.cancel()
     }
 
-    func loadThread(_ threadID: String, force: Bool = false) async {
+    func loadThread(_ threadID: String, force: Bool = false, replacingHistory: Bool = false) async {
         if liveRunning && !force { return }
         detailLoadGeneration += 1
         let generation = detailLoadGeneration
         do {
-            let result: ThreadDetail = try await client.get(client.threadPath(threadID))
+            let result: ThreadDetail = try await client.get(
+                client.threadPath(threadID),
+                queryItems: [URLQueryItem(name: "view", value: "compact")]
+            )
             guard selectedThreadID == threadID, generation == detailLoadGeneration else { return }
-            detail = result
-            conversationCache.saveThreadDetail(result, threadID: threadID)
+            let updatedDetail = replacingHistory ? result : mergingLatestPage(result, into: detail)
+            if detail != updatedDetail {
+                detail = updatedDetail
+                let cache = conversationCache
+                Task.detached(priority: .utility) {
+                    cache.saveThreadDetail(result, threadID: threadID)
+                }
+            }
+            rebuildMessageIndex(from: updatedDetail, threadID: threadID)
             removePersistedLiveMessages(from: result)
             liveRunning = result.thread.isActive
             if let error = result.turns.last(where: { $0.error != nil })?.error {
@@ -799,6 +894,78 @@ final class AppViewModel: ObservableObject {
             }
         } catch {
             status = "读取会话失败：\(error.localizedDescription)"
+        }
+    }
+
+    func loadMessageFromIndex(messageID: String, turnID: String) async -> Bool {
+        renderedMessages.contains { $0.id == messageID }
+    }
+
+    func loadTurnDetails(turnID: String) async -> Bool {
+        guard let threadID = selectedThreadID,
+              let current = detail,
+              let index = current.turns.firstIndex(where: { $0.id == turnID }) else { return false }
+        if current.turns[index].detailsLoaded == true { return true }
+        do {
+            let result: TurnDetailResponse = try await client.get(client.threadTurnPath(threadID, turnID: turnID))
+            guard selectedThreadID == threadID, let latest = detail,
+                  let latestIndex = latest.turns.firstIndex(where: { $0.id == turnID }) else { return false }
+            var turns = latest.turns
+            turns[latestIndex] = result.turn
+            detail = ThreadDetail(
+                thread: latest.thread,
+                turns: turns,
+                hasMoreBefore: false,
+                nextBefore: nil
+            )
+            return true
+        } catch {
+            status = "读取过程详情失败：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func mergingLatestPage(_ latest: ThreadDetail, into current: ThreadDetail?) -> ThreadDetail {
+        guard let current, !current.turns.isEmpty else { return latest }
+        let currentByID = Dictionary(uniqueKeysWithValues: current.turns.map { ($0.id, $0) })
+        let turns = latest.turns.map { compactTurn in
+            guard let existing = currentByID[compactTurn.id], existing.detailsLoaded == true else { return compactTurn }
+            return existing
+        }
+        return ThreadDetail(
+            thread: latest.thread,
+            turns: turns,
+            hasMoreBefore: false,
+            nextBefore: nil
+        )
+    }
+
+    private func rebuildMessageIndex(from detail: ThreadDetail, threadID: String) {
+        let items = detail.turns.flatMap { turn in
+            let turnItems = turn.items ?? []
+            let finalAgentIndex = turnItems.lastIndex { $0.type == "agentMessage" && $0.phase == "final_answer" }
+                ?? turnItems.lastIndex { $0.type == "agentMessage" }
+            return turnItems.enumerated().compactMap { index, item -> MessageIndexItem? in
+                guard item.type == "userMessage" || index == finalAgentIndex else { return nil }
+                let text = item.renderedText
+                    .prefix(240)
+                    .split(whereSeparator: { $0.isWhitespace })
+                    .joined(separator: " ")
+                guard !text.isEmpty else { return nil }
+                return MessageIndexItem(
+                    id: item.id ?? "\(turn.id)-\(item.type)-\(index)",
+                    turnId: turn.id,
+                    role: item.type == "userMessage" ? "user" : "assistant",
+                    text: text,
+                    createdAt: item.createdAt ?? turn.startedAt
+                )
+            }
+        }
+        guard items != messageIndex else { return }
+        messageIndex = items
+        let cache = conversationCache
+        Task.detached(priority: .utility) {
+            cache.saveMessageIndex(items, threadID: threadID)
         }
     }
 
@@ -1108,12 +1275,14 @@ final class AppViewModel: ObservableObject {
 
         if method == "turn/started" {
             liveRunning = true
+            let turnID = params["turnId"] as? String ?? UUID().uuidString
+            activeTurnNotificationKeys[expectedThreadID] = turnID
             clearLiveMessages()
             localError = nil
         } else if method == "item/started" {
             let item = params["item"] as? [String: Any]
-            if item?["type"] as? String == "commandExecution" {
-                upsertLiveExecution(item: item ?? [:], turnID: params["turnId"] as? String, status: "inProgress")
+            if let item, isLiveExecutionItem(item) {
+                upsertLiveExecution(item: item, turnID: params["turnId"] as? String, status: "inProgress")
                 liveRunning = true
                 return
             }
@@ -1131,13 +1300,13 @@ final class AppViewModel: ObservableObject {
             liveRunning = true
             guard let itemID = params["itemId"] as? String else { return }
             appendLiveDelta(id: itemID, turnID: params["turnId"] as? String, delta: params["delta"] as? String ?? "")
-        } else if method == "item/completed" {
+        } else if method == "item/completed" || method == "item/updated" {
             let item = params["item"] as? [String: Any]
-            if item?["type"] as? String == "commandExecution" {
+            if let item, isLiveExecutionItem(item) {
                 upsertLiveExecution(
-                    item: item ?? [:],
+                    item: item,
                     turnID: params["turnId"] as? String,
-                    status: item?["status"] as? String ?? "completed"
+                    status: item["status"] as? String ?? "completed"
                 )
                 return
             }
@@ -1157,18 +1326,9 @@ final class AppViewModel: ObservableObject {
             if let errorText = notificationErrorText(params) {
                 localError = errorText
                 status = "任务失败：\(errorText)"
-                CloudexAppDelegate.notifications.scheduleTaskResult(
-                    threadID: expectedThreadID,
-                    title: selectedThread?.title ?? "当前对话",
-                    success: false,
-                    detail: errorText
-                )
+                notifyTaskResultOnce(threadID: expectedThreadID, params: params, success: false, detail: errorText)
             } else {
-                CloudexAppDelegate.notifications.scheduleTaskResult(
-                    threadID: expectedThreadID,
-                    title: selectedThread?.title ?? "当前对话",
-                    success: false
-                )
+                notifyTaskResultOnce(threadID: expectedThreadID, params: params, success: false)
             }
             reloadAfterEvent(expectedThreadID)
         } else if method == "turn/completed" {
@@ -1176,19 +1336,10 @@ final class AppViewModel: ObservableObject {
             if let errorText = notificationErrorText(params) {
                 localError = errorText
                 status = "任务失败：\(errorText)"
-                CloudexAppDelegate.notifications.scheduleTaskResult(
-                    threadID: expectedThreadID,
-                    title: selectedThread?.title ?? "当前对话",
-                    success: false,
-                    detail: errorText
-                )
+                notifyTaskResultOnce(threadID: expectedThreadID, params: params, success: false, detail: errorText)
             } else {
                 localError = nil
-                CloudexAppDelegate.notifications.scheduleTaskResult(
-                    threadID: expectedThreadID,
-                    title: selectedThread?.title ?? "当前对话",
-                    success: true
-                )
+                notifyTaskResultOnce(threadID: expectedThreadID, params: params, success: true)
             }
             reloadAfterEvent(expectedThreadID)
         } else if method == "thread/archived" || method == "thread/name/updated" {
@@ -1205,6 +1356,26 @@ final class AppViewModel: ObservableObject {
         let code = error["codexErrorInfo"] ?? error["codex_error_info"] ?? error["code"] ?? error["type"]
         if let code = code as? String, !code.isEmpty { return "\(message)\n错误代码：\(code)" }
         return message
+    }
+
+    private func notifyTaskResultOnce(
+        threadID: String,
+        params: [String: Any],
+        success: Bool,
+        detail: String? = nil
+    ) {
+        let turnID = params["turnId"] as? String
+            ?? (params["turn"] as? [String: Any])?["id"] as? String
+        let key = activeTurnNotificationKeys[threadID]
+            ?? turnID
+            ?? "thread-\(threadID)"
+        guard sentTaskResultNotificationKeys.insert("\(threadID):\(key)").inserted else { return }
+        CloudexAppDelegate.notifications.scheduleTaskResult(
+            threadID: threadID,
+            title: selectedThread?.title ?? "当前对话",
+            success: success,
+            detail: detail
+        )
     }
 
     private func reloadAfterEvent(_ threadID: String) {

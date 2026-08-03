@@ -321,21 +321,116 @@ async function listAllThreads(archived = false) {
   return threads;
 }
 
-async function readThreadDetail(threadId) {
-  if (config.historySource === "cli-local") return readCliThreadById(threadId);
-  const result = await client.request("thread/read", { threadId, includeTurns: true });
-  const thread = result.thread || result;
-  return { thread, turns: thread.turns || [] };
+async function readThreadDetail(threadId, { limit = Number.MAX_SAFE_INTEGER, before = null, around = null } = {}) {
+  const fullDetail = config.historySource === "cli-local"
+    ? await readCliThreadById(threadId)
+    : await client.request("thread/read", { threadId, includeTurns: true }).then((result) => {
+        const thread = result.thread || result;
+        return { thread, turns: thread.turns || [] };
+      });
+  const turns = fullDetail.turns || [];
+  const aroundIndex = around ? turns.findIndex((turn) => turn.id === around) : -1;
+  const beforeIndex = before ? turns.findIndex((turn) => turn.id === before) : turns.length;
+  let end = beforeIndex >= 0 ? beforeIndex : turns.length;
+  let start = Math.max(0, end - limit);
+  if (aroundIndex >= 0) {
+    start = Math.max(0, aroundIndex - Math.floor((limit - 1) / 2));
+    end = Math.min(turns.length, start + limit);
+    start = Math.max(0, end - limit);
+  }
+  const page = turns.slice(start, end);
+  return {
+    thread: fullDetail.thread,
+    turns: page,
+    hasMoreBefore: start > 0,
+    nextBefore: start > 0 ? page[0]?.id || null : null,
+  };
+}
+
+function itemText(item) {
+  const contentText = (item.content || []).map((part) => part.text || part.value || "").join("");
+  return String(item.type === "userMessage" ? contentText : (item.text || contentText)).trim();
+}
+
+function messageIndexFromDetail(detail) {
+  const data = [];
+  for (const turn of detail.turns || []) {
+    const items = turn.items || [];
+    const finalAgentIndex = items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer") >= 0
+      ? items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer")
+      : items.findLastIndex((item) => item.type === "agentMessage");
+    items.forEach((item, index) => {
+      if (item.type !== "userMessage" && index !== finalAgentIndex) return;
+      const text = itemText(item);
+      if (!text) return;
+      data.push({
+        id: item.id || `${turn.id}-${item.type}-${index}`,
+        turnId: turn.id,
+        role: item.type === "userMessage" ? "user" : "assistant",
+        text: text.replace(/\s+/g, " ").slice(0, 240),
+        createdAt: item.createdAt || turn.startedAt || null,
+      });
+    });
+  }
+  return { data };
+}
+
+function compactTurn(turn) {
+  const items = turn.items || [];
+  const finalAgentIndex = items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer") >= 0
+    ? items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer")
+    : items.findLastIndex((item) => item.type === "agentMessage");
+  const visibleItems = items.filter((item, index) => item.type === "userMessage" || index === finalAgentIndex);
+  const processItemCount = Math.max(0, items.length - visibleItems.length);
+  return {
+    ...turn,
+    items: visibleItems,
+    processItemCount,
+    detailsLoaded: processItemCount === 0,
+  };
+}
+
+function compactThreadDetail(detail) {
+  return {
+    thread: detail.thread,
+    turns: (detail.turns || []).map(compactTurn),
+    hasMoreBefore: false,
+    nextBefore: null,
+  };
+}
+
+const NO_PROJECT_CWD = "未指定项目目录";
+
+function projectCwdForThread(thread) {
+  const cwd = String(thread.cwd || "").trim();
+  if (!cwd || cwd === NO_PROJECT_CWD) return NO_PROJECT_CWD;
+
+  const resolved = path.resolve(cwd);
+  const home = path.resolve(os.homedir());
+  const codexScratchRoot = path.join(home, "Documents", "Codex");
+  const codexStateRoot = path.join(home, ".codex");
+  const isInside = (root) => {
+    const relative = path.relative(root, resolved);
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  };
+
+  // Codex creates dated scratch directories when a conversation is started
+  // without choosing a project. Their final path component looks like a
+  // project name (for example bh-w or token-api-api), but it is not one.
+  if (resolved === home || isInside(codexScratchRoot) || isInside(codexStateRoot)) {
+    return NO_PROJECT_CWD;
+  }
+  return cwd;
 }
 
 function projectsFromThreads(threads) {
   const projects = new Map();
   for (const thread of threads) {
-    const cwd = thread.cwd || "未指定项目目录";
+    const cwd = projectCwdForThread(thread);
     if (!projects.has(cwd)) {
       projects.set(cwd, {
         id: cwd,
-        name: path.basename(cwd) || cwd,
+        name: cwd === NO_PROJECT_CWD ? "无项目" : path.basename(cwd) || cwd,
         cwd,
         threads: [],
         updatedAt: thread.updatedAt || thread.createdAt || 0,
@@ -559,8 +654,34 @@ async function handle(req, res, url) {
   const detailMatch = url.pathname.match(/^\/api\/threads\/([^/]+)$/);
   if (req.method === "GET" && detailMatch) {
     const threadId = decodeURIComponent(detailMatch[1]);
-    const result = await readThreadDetail(threadId);
-    return json(res, 200, result);
+    const rawLimit = url.searchParams.get("limit");
+    const requestedLimit = rawLimit === null ? Number.MAX_SAFE_INTEGER : Number.parseInt(rawLimit, 10);
+    const limit = rawLimit === null
+      ? Number.MAX_SAFE_INTEGER
+      : (Number.isFinite(requestedLimit) ? Math.min(20, Math.max(1, requestedLimit)) : 3);
+    const before = url.searchParams.get("before") || null;
+    const around = url.searchParams.get("around") || null;
+    const result = await readThreadDetail(threadId, { limit, before, around });
+    return json(res, 200, url.searchParams.get("view") === "compact" ? compactThreadDetail(result) : result);
+  }
+  const turnDetailMatch = url.pathname.match(/^\/api\/threads\/([^/]+)\/turns\/([^/]+)$/);
+  if (req.method === "GET" && turnDetailMatch) {
+    const threadId = decodeURIComponent(turnDetailMatch[1]);
+    const turnId = decodeURIComponent(turnDetailMatch[2]);
+    const detail = await readThreadDetail(threadId);
+    const turn = detail.turns.find((candidate) => candidate.id === turnId);
+    if (!turn) {
+      const error = new Error("Turn not found");
+      error.status = 404;
+      throw error;
+    }
+    return json(res, 200, { turn: { ...turn, detailsLoaded: true, processItemCount: null } });
+  }
+  const messageIndexMatch = url.pathname.match(/^\/api\/threads\/([^/]+)\/message-index$/);
+  if (req.method === "GET" && messageIndexMatch) {
+    const threadId = decodeURIComponent(messageIndexMatch[1]);
+    const detail = await readThreadDetail(threadId);
+    return json(res, 200, messageIndexFromDetail(detail));
   }
   const streamMatch = url.pathname.match(/^\/api\/threads\/([^/]+)\/stream$/);
   if (req.method === "GET" && streamMatch) {

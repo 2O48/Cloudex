@@ -9,7 +9,7 @@ struct CloudexNativeApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            CloudexRootView()
                 .environmentObject(viewModel)
                 .onAppear {
                     CloudexAppDelegate.notifications.attach(viewModel: viewModel)
@@ -75,7 +75,6 @@ final class CloudexNotificationManager: NSObject, UNUserNotificationCenterDelega
     }
 
     func scheduleApproval(_ approval: ApprovalRequest) {
-        guard !appIsInForeground else { return }
         guard UserDefaults.standard.object(forKey: "cloudex.notifyApprovals") as? Bool ?? true else { return }
         let content = UNMutableNotificationContent()
         content.title = "Cloudex 需要你的确认"
@@ -98,7 +97,6 @@ final class CloudexNotificationManager: NSObject, UNUserNotificationCenterDelega
     }
 
     func scheduleTaskResult(threadID: String, title: String, success: Bool, detail: String? = nil) {
-        guard !appIsInForeground else { return }
         let enabled = UserDefaults.standard.object(
             forKey: success ? "cloudex.notifyTaskSuccess" : "cloudex.notifyTaskFailure"
         ) as? Bool ?? true
@@ -121,7 +119,7 @@ final class CloudexNotificationManager: NSObject, UNUserNotificationCenterDelega
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        completionHandler([])
+        completionHandler([.banner, .sound, .badge])
     }
 
     func userNotificationCenter(

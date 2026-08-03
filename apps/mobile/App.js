@@ -15,9 +15,13 @@ import {
   TextInput,
   View,
 } from "react-native";
-import { ENDPOINTS, threadEndpoint, threadStreamEndpoint } from "@cloudex/shared";
+import { ENDPOINTS, threadEndpoint, threadStreamEndpoint, withQuery } from "@cloudex/shared";
 
-const expoHost = Constants.expoConfig?.hostUri?.split(":")[0];
+const expoHost = (
+  Constants.expoConfig?.hostUri
+  || Constants.expoGoConfig?.debuggerHost
+  || ""
+).split(":")[0];
 const defaultServerUrl = expoHost ? `http://${expoHost}:8787` : "http://127.0.0.1:8787";
 const defaultAuthToken = process.env.EXPO_PUBLIC_CLOUDEX_AUTH_TOKEN || "";
 
@@ -314,23 +318,33 @@ export default function App() {
   }, []);
 
   const request = useCallback(async (endpoint, options = {}) => {
-    const response = await fetch(`${api}${endpoint}`, {
-      ...options,
-      headers: {
-        "content-type": "application/json",
-        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-        ...(options.headers || {}),
-      },
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-    return data;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    try {
+      const response = await fetch(`${api}${endpoint}`, {
+        ...options,
+        signal: controller.signal,
+        headers: {
+          "content-type": "application/json",
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+          ...(options.headers || {}),
+        },
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      return data;
+    } catch (error) {
+      if (error?.name === "AbortError") throw new Error("请求超时，请检查服务器地址、网络和 Token");
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
   }, [api, authToken]);
 
   const loadThread = useCallback(async (threadId, options = {}) => {
     if (!options.force && liveRunningRef.current && threadId === selectedThreadIdRef.current) return null;
     try {
-      const result = await request(threadEndpoint(threadId));
+      const result = await request(withQuery(threadEndpoint(threadId), { view: "compact" }));
       setDetail(result);
       const errorText = latestTurnErrorText(result.turns || []);
       if (errorText) setStatus(`任务失败：${errorText}`);

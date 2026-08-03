@@ -1,6 +1,6 @@
 import Foundation
 
-enum ConnectionMode: String, CaseIterable, Identifiable {
+enum ConnectionMode: String, CaseIterable, Identifiable, Codable {
     case automatic
     case lan
     case tailscale
@@ -19,6 +19,27 @@ enum ConnectionMode: String, CaseIterable, Identifiable {
 struct HealthResponse: Codable {
     let ok: Bool
     let codexConnected: Bool?
+}
+
+struct ConnectionHistoryItem: Codable, Identifiable, Equatable {
+    let id: String
+    let serverURL: String
+    let token: String
+    let connectionMode: ConnectionMode
+    var lastUsedAt: Double
+
+    init(serverURL: String, token: String, connectionMode: ConnectionMode, lastUsedAt: Double = Date().timeIntervalSince1970) {
+        self.id = "\(serverURL)|\(token)"
+        self.serverURL = serverURL
+        self.token = token
+        self.connectionMode = connectionMode
+        self.lastUsedAt = lastUsedAt
+    }
+
+    var maskedToken: String {
+        guard token.count > 8 else { return String(repeating: "•", count: max(4, token.count)) }
+        return "\(token.prefix(4))••••\(token.suffix(4))"
+    }
 }
 
 struct ProjectsResponse: Codable {
@@ -95,9 +116,9 @@ struct CloudexProject: Codable, Identifiable, Equatable {
 
     var displayName: String {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty && !Self.isNoProjectLikeName(trimmed) { return trimmed }
+        if !trimmed.isEmpty { return trimmed }
         let components = cwd.split(separator: "/").map(String.init)
-        if let last = components.last, !Self.isNoProjectLikeName(last) { return last }
+        if let last = components.last { return last }
         if components.count >= 2 {
             return "\(components[components.count - 2]) / \(components[components.count - 1])"
         }
@@ -109,16 +130,7 @@ struct CloudexProject: Codable, Identifiable, Equatable {
         if trimmed.isEmpty || trimmed == "未指定项目目录" { return true }
         if trimmed.contains("/Documents/Codex/") || trimmed.hasSuffix("/Documents/Codex") { return true }
         if trimmed.contains("/.codex/") { return true }
-        return Self.isNoProjectLikeName(name)
-    }
-
-    private static func isNoProjectLikeName(_ value: String) -> Bool {
-        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if normalized.isEmpty || normalized == "未指定项目目录" { return true }
-        if ["bh", "bh-w", "openclaw-discord-discord"].contains(normalized) { return true }
-        let parts = normalized.split(separator: "-")
-        if parts.count >= 2 && Set(parts).count == 1 { return true }
-        return normalized.count <= 3 && normalized.range(of: #"^[a-z0-9-]+$"#, options: .regularExpression) != nil
+        return false
     }
 }
 
@@ -172,6 +184,14 @@ struct CloudexUsage: Codable, Equatable {
         modelContextWindow = camelContextWindow ?? snakeContextWindow
         updatedAt = try container.decodeIfPresent(Double.self, forKey: .updatedAt)
     }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(total, forKey: .total)
+        try container.encodeIfPresent(last, forKey: .last)
+        try container.encodeIfPresent(modelContextWindow, forKey: .modelContextWindow)
+        try container.encodeIfPresent(updatedAt, forKey: .updatedAt)
+    }
 }
 
 struct TokenUsage: Codable, Equatable {
@@ -212,6 +232,15 @@ struct TokenUsage: Codable, Equatable {
         let snakeTotal = try container.decodeIfPresent(Int.self, forKey: .totalTokensSnake)
         totalTokens = camelTotal ?? snakeTotal
     }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(inputTokens, forKey: .inputTokens)
+        try container.encodeIfPresent(cachedInputTokens, forKey: .cachedInputTokens)
+        try container.encodeIfPresent(outputTokens, forKey: .outputTokens)
+        try container.encodeIfPresent(reasoningOutputTokens, forKey: .reasoningOutputTokens)
+        try container.encodeIfPresent(totalTokens, forKey: .totalTokens)
+    }
 }
 
 struct ThreadStatus: Codable, Equatable {
@@ -219,12 +248,26 @@ struct ThreadStatus: Codable, Equatable {
     let activeFlags: [String]?
 }
 
-struct ThreadDetail: Codable {
+struct ThreadDetail: Codable, Equatable {
     let thread: CloudexThread
     let turns: [CloudexTurn]
+    var hasMoreBefore: Bool? = nil
+    var nextBefore: String? = nil
 }
 
-struct CloudexTurn: Codable {
+struct MessageIndexResponse: Codable {
+    let data: [MessageIndexItem]
+}
+
+struct MessageIndexItem: Codable, Identifiable, Equatable {
+    let id: String
+    let turnId: String
+    let role: String
+    let text: String
+    let createdAt: Double?
+}
+
+struct CloudexTurn: Codable, Equatable {
     let id: String
     let items: [TurnItem]?
     let status: String?
@@ -234,9 +277,15 @@ struct CloudexTurn: Codable {
     let durationMs: Double?
     let compressed: Bool?
     let itemsView: String?
+    var processItemCount: Int? = nil
+    var detailsLoaded: Bool? = nil
 }
 
-struct TurnItem: Codable {
+struct TurnDetailResponse: Codable {
+    let turn: CloudexTurn
+}
+
+struct TurnItem: Codable, Equatable {
     let type: String
     let id: String?
     let text: String?
@@ -284,13 +333,13 @@ struct EditDiffLinePayload: Codable, Equatable, Identifiable, Sendable {
     var id: String { "\(kind)-\(lineNumber ?? -1)-\(text)" }
 }
 
-struct TurnContent: Codable {
+struct TurnContent: Codable, Equatable {
     let type: String?
     let text: String?
     let value: String?
 }
 
-struct TurnErrorPayload: Codable {
+struct TurnErrorPayload: Codable, Equatable {
     let message: String
     let code: String?
 
@@ -380,6 +429,17 @@ struct CodexModel: Codable, Equatable {
         defaultReasoningEffort = nativeDefault ?? camelDefault ?? snakeDefault
     }
 
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(rawID, forKey: .rawID)
+        try container.encodeIfPresent(model, forKey: .model)
+        try container.encodeIfPresent(displayName, forKey: .displayName)
+        try container.encodeIfPresent(hidden, forKey: .hidden)
+        try container.encodeIfPresent(isDefault, forKey: .isDefault)
+        try container.encodeIfPresent(supportedReasoningEfforts, forKey: .supportedReasoningEfforts)
+        try container.encodeIfPresent(defaultReasoningEffort, forKey: .defaultReasoningEffort)
+    }
+
     var identifier: String { rawID ?? model ?? displayName ?? "unknown" }
     var title: String { displayName ?? model ?? rawID ?? "未知模型" }
 }
@@ -414,6 +474,12 @@ struct ReasoningEffortOption: Codable, Equatable, Identifiable {
         }
         self.reasoningEffort = reasoningEffort
         description = try container.decodeIfPresent(String.self, forKey: .description)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(reasoningEffort, forKey: .reasoningEffort)
+        try container.encodeIfPresent(description, forKey: .description)
     }
 
     var id: String { reasoningEffort }
@@ -482,6 +548,9 @@ struct ChatMessage: Identifiable, Equatable {
     var createdAt: Double? = nil
     var isCompressed: Bool = false
     var threadID: String? = nil
+    var sourceTurnID: String? = nil
+    var processItemCount: Int? = nil
+    var processDetailsLoaded: Bool = true
 }
 
 struct SSEEvent {

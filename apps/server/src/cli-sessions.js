@@ -1,9 +1,37 @@
+import os from "node:os";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { config } from "./config.js";
 
 const SESSION_FILE_RE = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
 const ARCHIVE_FILE = path.join(config.stateDir, "archived-cli-threads.json");
+const SESSION_INDEX_FILE = path.join(os.homedir(), ".codex", "session_index.jsonl");
+let sessionIndexSignature = "";
+let sessionIndexNames = new Map();
+
+async function readSessionIndexNames() {
+  try {
+    const stat = await fs.stat(SESSION_INDEX_FILE);
+    const signature = `${stat.mtimeMs}:${stat.size}`;
+    if (signature === sessionIndexSignature) return sessionIndexNames;
+
+    const names = new Map();
+    const raw = await fs.readFile(SESSION_INDEX_FILE, "utf8");
+    for (const line of raw.split("\n")) {
+      const record = safeJson(line);
+      const id = typeof record?.id === "string" ? record.id.trim() : "";
+      const name = [record?.thread_name, record?.name, record?.title]
+        .find((value) => typeof value === "string" && value.trim());
+      if (id && name) names.set(id, name.trim());
+    }
+    sessionIndexSignature = signature;
+    sessionIndexNames = names;
+  } catch {
+    sessionIndexSignature = "";
+    sessionIndexNames = new Map();
+  }
+  return sessionIndexNames;
+}
 
 function timestampSeconds(value) {
   if (typeof value === "number") return value > 1_000_000_000_000 ? Math.floor(value / 1000) : value;
@@ -343,6 +371,20 @@ function statusFromTurns(turns, updatedAt) {
   return { type: "idle" };
 }
 
+function usageFromPayload(payload, timestamp) {
+  const info = payload?.info || {};
+  const total = info.total_token_usage || null;
+  const last = info.last_token_usage || null;
+  if (!total && !last && !payload?.rate_limits) return null;
+  return {
+    total,
+    last,
+    modelContextWindow: info.model_context_window || null,
+    rateLimits: payload.rate_limits || null,
+    updatedAt: timestamp,
+  };
+}
+
 function parseSessionLine(state, record) {
   if (!record) return;
   const timestamp = timestampSeconds(record.timestamp);
@@ -484,6 +526,10 @@ function parseSessionLine(state, record) {
 
   if (record.type !== "event_msg") return;
   state.name = threadNameFromPayload(payload) || state.name;
+  if (payload.type === "token_count") {
+    state.usage = usageFromPayload(payload, timestamp);
+    return;
+  }
   if (payload.type === "thread_settings_applied") {
     const settings = payload.thread_settings || {};
     state.cwd = settings.cwd || state.cwd;
@@ -586,11 +632,14 @@ export async function readCliThread(filePath) {
     toolCallMap: new Map(),
     sessionCommandMap: new Map(),
     turns: [],
+    usage: null,
   };
   const raw = await fs.readFile(filePath, "utf8");
   for (const line of raw.split("\n")) {
     if (line.trim()) parseSessionLine(state, safeJson(line));
   }
+  const indexedName = (await readSessionIndexNames()).get(state.id);
+  if (indexedName) state.name = indexedName;
   const createdAt = state.createdAt || stat.birthtimeMs / 1000 || state.updatedAt;
   const updatedAt = Math.max(state.updatedAt || 0, stat.mtimeMs / 1000);
   const thread = {
@@ -620,6 +669,7 @@ export async function readCliThread(filePath) {
     agentRole: null,
     gitInfo: null,
     name: state.name || null,
+    usage: state.usage,
     turns: state.turns,
   };
   return { thread, turns: state.turns };

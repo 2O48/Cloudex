@@ -1,4 +1,5 @@
 import http from "node:http";
+import os from "node:os";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { config } from "./config.js";
@@ -11,6 +12,8 @@ const globalSubscribers = new Set();
 const eventHistory = new Map();
 const pendingApprovals = new Map();
 const EVENT_HISTORY_LIMIT = 250;
+const MODELS_CACHE_FILE = process.env.CLOUDEX_MODELS_CACHE
+  || path.join(os.homedir(), ".codex", "models_cache.json");
 let eventSequence = 0;
 let latestThreadSignature = "";
 let latestProjectSnapshot = null;
@@ -18,6 +21,84 @@ let syncInFlight = false;
 let syncAgainReason = null;
 let syncTimer = null;
 let syncInterval = null;
+
+function normalizeModel(model) {
+  const id = model?.id || model?.model || model?.slug;
+  if (!id) return null;
+  const rawLevels = model.supportedReasoningEfforts
+    || model.supportedReasoningLevels
+    || model.supported_reasoning_levels
+    || [];
+  const supportedReasoningEfforts = rawLevels
+    .map((level) => {
+      if (typeof level === "string") return { reasoningEffort: level, description: null };
+      const reasoningEffort = level?.reasoningEffort || level?.effort || level?.reasoning_level || level?.level;
+      return reasoningEffort
+        ? { reasoningEffort, description: level.description || null }
+        : null;
+    })
+    .filter(Boolean);
+  const supportedReasoningLevels = supportedReasoningEfforts.map(({ reasoningEffort, description }) => ({
+    effort: reasoningEffort,
+    description,
+  }));
+  const defaultReasoningEffort = model.defaultReasoningEffort
+    || model.defaultReasoningLevel
+    || model.default_reasoning_level
+    || supportedReasoningEfforts[0]?.reasoningEffort
+    || null;
+  return {
+    ...model,
+    id,
+    model: model.model || id,
+    displayName: model.displayName || model.display_name || id,
+    defaultReasoningLevel: defaultReasoningEffort,
+    supportedReasoningLevels,
+    defaultReasoningEffort,
+    supportedReasoningEfforts,
+    hidden: model.hidden ?? model.visibility === "hide",
+  };
+}
+
+function normalizeModelsResponse(result) {
+  return {
+    ...result,
+    data: (result?.data || []).map(normalizeModel).filter(Boolean),
+  };
+}
+
+async function readCachedModels() {
+  try {
+    const payload = JSON.parse(await fs.readFile(MODELS_CACHE_FILE, "utf8"));
+    const data = (payload.models || [])
+      .filter((model) => model?.visibility !== "hide" && model?.supported_in_api !== false)
+      .map(normalizeModel)
+      .filter(Boolean);
+    if (data.length === 0) return null;
+    return {
+      data,
+      nextCursor: null,
+      source: "local-cache",
+      cachedAt: payload.fetched_at || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function listModels() {
+  if (!client.socket || client.socket.closed) {
+    const cached = await readCachedModels();
+    if (cached) return cached;
+  }
+  try {
+    return normalizeModelsResponse(await client.request("model/list", { limit: 100 }));
+  } catch (error) {
+    const cached = await readCachedModels();
+    if (cached) return cached;
+    throw error;
+  }
+}
 
 function json(res, status, body) {
   res.writeHead(status, {
@@ -413,7 +494,7 @@ async function handle(req, res, url) {
     });
   }
   if (req.method === "GET" && url.pathname === "/api/models") {
-    return json(res, 200, await client.request("model/list", { limit: 100 }));
+    return json(res, 200, await listModels());
   }
   if (req.method === "GET" && url.pathname === "/api/projects") {
     const threads = await listAllThreads(false);

@@ -131,6 +131,7 @@ struct CloudexThread: Codable, Identifiable, Equatable {
     let model: String?
     let createdAt: Double?
     let updatedAt: Double?
+    let usage: CloudexUsage?
 
     var title: String {
         let value = name?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -145,6 +146,71 @@ struct CloudexThread: Codable, Identifiable, Equatable {
     private static func isNoiseTitle(_ value: String) -> Bool {
         let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return ["exec", "apply_patch", "tool", "command"].contains(normalized)
+    }
+}
+
+struct CloudexUsage: Codable, Equatable {
+    let total: TokenUsage?
+    let last: TokenUsage?
+    let modelContextWindow: Int?
+    let updatedAt: Double?
+
+    private enum CodingKeys: String, CodingKey {
+        case total
+        case last
+        case modelContextWindow
+        case modelContextWindowSnake = "model_context_window"
+        case updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        total = try container.decodeIfPresent(TokenUsage.self, forKey: .total)
+        last = try container.decodeIfPresent(TokenUsage.self, forKey: .last)
+        let camelContextWindow = try container.decodeIfPresent(Int.self, forKey: .modelContextWindow)
+        let snakeContextWindow = try container.decodeIfPresent(Int.self, forKey: .modelContextWindowSnake)
+        modelContextWindow = camelContextWindow ?? snakeContextWindow
+        updatedAt = try container.decodeIfPresent(Double.self, forKey: .updatedAt)
+    }
+}
+
+struct TokenUsage: Codable, Equatable {
+    let inputTokens: Int?
+    let cachedInputTokens: Int?
+    let outputTokens: Int?
+    let reasoningOutputTokens: Int?
+    let totalTokens: Int?
+
+    private enum CodingKeys: String, CodingKey {
+        case inputTokens
+        case cachedInputTokens
+        case outputTokens
+        case reasoningOutputTokens
+        case totalTokens
+        case inputTokensSnake = "input_tokens"
+        case cachedInputTokensSnake = "cached_input_tokens"
+        case outputTokensSnake = "output_tokens"
+        case reasoningOutputTokensSnake = "reasoning_output_tokens"
+        case totalTokensSnake = "total_tokens"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let camelInput = try container.decodeIfPresent(Int.self, forKey: .inputTokens)
+        let snakeInput = try container.decodeIfPresent(Int.self, forKey: .inputTokensSnake)
+        inputTokens = camelInput ?? snakeInput
+        let camelCachedInput = try container.decodeIfPresent(Int.self, forKey: .cachedInputTokens)
+        let snakeCachedInput = try container.decodeIfPresent(Int.self, forKey: .cachedInputTokensSnake)
+        cachedInputTokens = camelCachedInput ?? snakeCachedInput
+        let camelOutput = try container.decodeIfPresent(Int.self, forKey: .outputTokens)
+        let snakeOutput = try container.decodeIfPresent(Int.self, forKey: .outputTokensSnake)
+        outputTokens = camelOutput ?? snakeOutput
+        let camelReasoningOutput = try container.decodeIfPresent(Int.self, forKey: .reasoningOutputTokens)
+        let snakeReasoningOutput = try container.decodeIfPresent(Int.self, forKey: .reasoningOutputTokensSnake)
+        reasoningOutputTokens = camelReasoningOutput ?? snakeReasoningOutput
+        let camelTotal = try container.decodeIfPresent(Int.self, forKey: .totalTokens)
+        let snakeTotal = try container.decodeIfPresent(Int.self, forKey: .totalTokensSnake)
+        totalTokens = camelTotal ?? snakeTotal
     }
 }
 
@@ -290,7 +356,28 @@ struct CodexModel: Codable, Equatable {
         case hidden
         case isDefault
         case supportedReasoningEfforts
+        case supportedReasoningLevels
+        case supportedReasoningLevelsSnake = "supported_reasoning_levels"
         case defaultReasoningEffort
+        case defaultReasoningLevel
+        case defaultReasoningLevelSnake = "default_reasoning_level"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        rawID = try container.decodeIfPresent(String.self, forKey: .rawID)
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        displayName = try container.decodeIfPresent(String.self, forKey: .displayName)
+        hidden = try container.decodeIfPresent(Bool.self, forKey: .hidden)
+        isDefault = try container.decodeIfPresent(Bool.self, forKey: .isDefault)
+        let nativeEfforts = try container.decodeIfPresent([ReasoningEffortOption].self, forKey: .supportedReasoningEfforts)
+        let camelLevels = try container.decodeIfPresent([ReasoningEffortOption].self, forKey: .supportedReasoningLevels)
+        let snakeLevels = try container.decodeIfPresent([ReasoningEffortOption].self, forKey: .supportedReasoningLevelsSnake)
+        supportedReasoningEfforts = nativeEfforts ?? camelLevels ?? snakeLevels
+        let nativeDefault = try container.decodeIfPresent(String.self, forKey: .defaultReasoningEffort)
+        let camelDefault = try container.decodeIfPresent(String.self, forKey: .defaultReasoningLevel)
+        let snakeDefault = try container.decodeIfPresent(String.self, forKey: .defaultReasoningLevelSnake)
+        defaultReasoningEffort = nativeDefault ?? camelDefault ?? snakeDefault
     }
 
     var identifier: String { rawID ?? model ?? displayName ?? "unknown" }
@@ -300,6 +387,34 @@ struct CodexModel: Codable, Equatable {
 struct ReasoningEffortOption: Codable, Equatable, Identifiable {
     let reasoningEffort: String
     let description: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case reasoningEffort
+        case effort
+        case reasoningLevel = "reasoning_level"
+        case level
+        case description
+    }
+
+    init(from decoder: Decoder) throws {
+        if let single = try? decoder.singleValueContainer(),
+           let value = try? single.decode(String.self) {
+            reasoningEffort = value
+            description = nil
+            return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let native = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
+        let effort = try container.decodeIfPresent(String.self, forKey: .effort)
+        let snakeLevel = try container.decodeIfPresent(String.self, forKey: .reasoningLevel)
+        let level = try container.decodeIfPresent(String.self, forKey: .level)
+        guard let reasoningEffort = native ?? effort ?? snakeLevel ?? level else {
+            throw DecodingError.dataCorruptedError(forKey: .reasoningEffort, in: container,
+                                                   debugDescription: "Missing reasoning effort")
+        }
+        self.reasoningEffort = reasoningEffort
+        description = try container.decodeIfPresent(String.self, forKey: .description)
+    }
 
     var id: String { reasoningEffort }
 

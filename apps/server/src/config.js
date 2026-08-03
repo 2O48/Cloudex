@@ -4,11 +4,27 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 
 const standaloneCodexBin = path.join(os.homedir(), ".codex", "packages", "standalone", "current", "codex");
-const defaultCodexBin = fs.existsSync(standaloneCodexBin)
-  ? standaloneCodexBin
-  : "codex";
+function windowsCodexBin() {
+  if (process.platform !== "win32") return null;
+  const root = path.join(os.homedir(), "AppData", "Local", "OpenAI", "Codex", "bin");
+  try {
+    return fs.readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(root, entry.name, "codex.exe"))
+      .filter((candidate) => fs.existsSync(candidate))
+      .sort((left, right) => fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs)[0] || null;
+  } catch {
+    return null;
+  }
+}
 
-const host = process.env.HOST || "127.0.0.1";
+const defaultCodexBin = process.env.CODEX_BIN
+  || process.env.CODEX_CLI_PATH
+  || (fs.existsSync(standaloneCodexBin) ? standaloneCodexBin : null)
+  || windowsCodexBin()
+  || "codex";
+
+const host = process.env.HOST || "0.0.0.0";
 const authToken = process.env.AUTH_TOKEN || "";
 const fileRoots = (process.env.FILE_ROOTS || process.cwd())
   .split(path.delimiter)

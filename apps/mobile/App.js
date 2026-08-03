@@ -123,6 +123,37 @@ function formatDate(timestamp) {
   return new Date(timestamp * 1000).toLocaleString();
 }
 
+function formatTokenCount(value) {
+  const count = Number(value);
+  if (!Number.isFinite(count)) return "";
+  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+  if (count >= 1_000) return `${(count / 1_000).toFixed(1)}K`;
+  return String(count);
+}
+
+function formatUsage(usage) {
+  const total = formatTokenCount(usage?.total?.total_tokens);
+  const last = formatTokenCount(usage?.last?.total_tokens);
+  if (!total && !last) return "";
+  return [
+    `用量 ${total || "0"}`,
+    last ? `本次 ${last}` : "",
+  ].filter(Boolean).join(" · ");
+}
+
+function reasoningLevels(model) {
+  return model?.supportedReasoningLevels || model?.supported_reasoning_levels || [];
+}
+
+function defaultEffortForModel(model) {
+  const levels = reasoningLevels(model);
+  return model?.defaultReasoningLevel
+    || model?.default_reasoning_level
+    || levels.find((level) => level.effort === "medium")?.effort
+    || levels[0]?.effort
+    || "medium";
+}
+
 function parseSseEvent(raw) {
   const result = { data: [], event: "message", id: null };
   for (const line of raw.replace(/\r/g, "").split("\n")) {
@@ -188,6 +219,8 @@ export default function App() {
   const [models, setModels] = useState([]);
   const [selectedModel, setSelectedModel] = useState("");
   const [draftSelectedModel, setDraftSelectedModel] = useState("");
+  const [selectedEffort, setSelectedEffort] = useState("medium");
+  const [draftSelectedEffort, setDraftSelectedEffort] = useState("medium");
   const [projects, setProjects] = useState([]);
   const [threads, setThreads] = useState([]);
   const [selectedProjectCwd, setSelectedProjectCwd] = useState(null);
@@ -333,6 +366,10 @@ export default function App() {
       setThreads(nextThreads);
       setModels(nextModels);
       setSelectedModel((value) => value || nextModels.find((model) => model.isDefault)?.id || nextModels[0]?.id || "");
+      setSelectedEffort((value) => {
+        const model = nextModels.find((item) => item.id === selectedModel || item.model === selectedModel) || nextModels[0];
+        return reasoningLevels(model).some((level) => level.effort === value) ? value : defaultEffortForModel(model);
+      });
       if (selectedProjectCwd && !nextProjects.some((project) => project.cwd === selectedProjectCwd)) {
         setSelectedProjectCwd(null);
       }
@@ -345,7 +382,7 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [creatingNew, openThread, request, selectedProjectCwd, selectedThreadId]);
+  }, [creatingNew, openThread, request, selectedModel, selectedProjectCwd, selectedThreadId]);
 
   useEffect(() => { refresh(); }, [serverUrl, authToken, connectionVersion]);
 
@@ -543,7 +580,7 @@ export default function App() {
       if (!selectedThreadId) {
         const result = await request(ENDPOINTS.threads, {
           method: "POST",
-          body: JSON.stringify({ prompt, cwd: selectedProjectCwd || undefined, model: selectedModel || undefined }),
+          body: JSON.stringify({ prompt, cwd: selectedProjectCwd || undefined, model: selectedModel || undefined, effort: selectedEffort || undefined }),
         });
         setMessage("");
         setCreatingNew(false);
@@ -556,7 +593,7 @@ export default function App() {
       } else {
         await request(threadEndpoint(selectedThreadId, "message"), {
           method: "POST",
-          body: JSON.stringify({ message: prompt, model: selectedModel || undefined }),
+          body: JSON.stringify({ message: prompt, model: selectedModel || undefined, effort: selectedEffort || undefined }),
         });
         setMessage("");
         await loadThread(selectedThreadId);
@@ -602,6 +639,7 @@ export default function App() {
     setDraftServerUrl(serverUrl);
     setDraftAuthToken(authToken);
     setDraftSelectedModel(selectedModel);
+    setDraftSelectedEffort(selectedEffort);
     setSettingsOpen(true);
   };
 
@@ -609,11 +647,13 @@ export default function App() {
     setServerUrl(draftServerUrl.trim() || defaultServerUrl);
     setAuthToken(draftAuthToken.trim());
     setSelectedModel(draftSelectedModel);
+    setSelectedEffort(draftSelectedEffort);
     setConnectionVersion((value) => value + 1);
     setSettingsOpen(false);
   };
 
   const title = selectedThread?.name || selectedThread?.preview || (creatingNew ? "新对话" : "Cloudex");
+  const usageText = formatUsage(selectedThread?.usage);
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -624,6 +664,7 @@ export default function App() {
           onSettings={openSettings}
           projectName={selectedProject?.name}
           title={title}
+          usageText={usageText}
         />
         <ChatWindow
           busy={busy}
@@ -657,12 +698,18 @@ export default function App() {
 
       <SettingsModal
         authToken={draftAuthToken}
+        effort={draftSelectedEffort}
         models={models}
         onChangeAuthToken={setDraftAuthToken}
         onChangeServerUrl={setDraftServerUrl}
         onClose={() => setSettingsOpen(false)}
         onSave={saveSettings}
-        onSelectModel={setDraftSelectedModel}
+        onSelectEffort={setDraftSelectedEffort}
+        onSelectModel={(id) => {
+          setDraftSelectedModel(id);
+          const model = models.find((item) => item.id === id || item.model === id);
+          setDraftSelectedEffort(defaultEffortForModel(model));
+        }}
         selectedModel={draftSelectedModel}
         serverUrl={draftServerUrl}
         status={status}
@@ -672,7 +719,7 @@ export default function App() {
   );
 }
 
-function Header({ connected, onMenu, onSettings, projectName, title }) {
+function Header({ connected, onMenu, onSettings, projectName, title, usageText }) {
   return (
     <View style={styles.header}>
       <Pressable accessibilityLabel="打开项目菜单" onPress={onMenu} style={styles.headerButton}>
@@ -680,11 +727,12 @@ function Header({ connected, onMenu, onSettings, projectName, title }) {
       </Pressable>
       <View style={styles.headerCenter}>
         <Text numberOfLines={1} style={styles.headerTitle}>{title}</Text>
-        <View style={styles.headerSubtitleRow}>
-          <View style={[styles.connectionDot, connected ? styles.connectedDot : styles.disconnectedDot]} />
-          <Text numberOfLines={1} style={styles.headerSubtitle}>{projectName || "选择项目"}</Text>
+          <View style={styles.headerSubtitleRow}>
+            <View style={[styles.connectionDot, connected ? styles.connectedDot : styles.disconnectedDot]} />
+            <Text numberOfLines={1} style={styles.headerSubtitle}>{projectName || "选择项目"}</Text>
+          </View>
+          {!!usageText && <Text numberOfLines={1} style={styles.headerUsage}>{usageText} tokens</Text>}
         </View>
-      </View>
       <Pressable accessibilityLabel="打开设置" onPress={onSettings} style={styles.headerButton}>
         <Text style={styles.headerIcon}>⚙︎</Text>
       </Pressable>
@@ -823,7 +871,9 @@ function NavigationDrawer({ onArchive, onClose, onNewChat, onOpenThread, onRefre
   );
 }
 
-function SettingsModal({ authToken, models, onChangeAuthToken, onChangeServerUrl, onClose, onSave, onSelectModel, selectedModel, serverUrl, status, visible }) {
+function SettingsModal({ authToken, effort, models, onChangeAuthToken, onChangeServerUrl, onClose, onSave, onSelectEffort, onSelectModel, selectedModel, serverUrl, status, visible }) {
+  const selectedModelInfo = models.find((model) => model.id === selectedModel || model.model === selectedModel);
+  const levels = reasoningLevels(selectedModelInfo);
   return (
     <Modal animationType="fade" onRequestClose={onClose} transparent visible={visible}>
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.modalOverlay}>
@@ -864,6 +914,18 @@ function SettingsModal({ authToken, models, onChangeAuthToken, onChangeServerUrl
             })}
             {models.length === 0 && <Text style={styles.emptyText}>连接后自动读取可用模型</Text>}
           </ScrollView>
+          <Text style={styles.settingLabel}>推理强度</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.modelPills}>
+            {levels.map((level) => {
+              const active = effort === level.effort;
+              return (
+                <Pressable key={level.effort} onPress={() => onSelectEffort(level.effort)} style={[styles.modelPill, active && styles.selectedModelPill]}>
+                  <Text style={[styles.modelPillText, active && styles.selectedModelPillText]}>{String(level.effort).toUpperCase()}</Text>
+                </Pressable>
+              );
+            })}
+            {levels.length === 0 && <Text style={styles.emptyText}>选择模型后读取可用推理强度</Text>}
+          </ScrollView>
           <Text style={styles.settingsStatus}>{status}</Text>
           <Pressable onPress={onSave} style={styles.saveButton}><Text style={styles.saveText}>保存并连接</Text></Pressable>
         </View>
@@ -882,6 +944,7 @@ const styles = StyleSheet.create({
   headerTitle: { color: "#171717", fontSize: 16, fontWeight: "700", maxWidth: "100%" },
   headerSubtitleRow: { alignItems: "center", flexDirection: "row", gap: 5, marginTop: 2 },
   headerSubtitle: { color: "#777", fontSize: 11, maxWidth: 180 },
+  headerUsage: { color: "#777", fontSize: 10, marginTop: 1, maxWidth: "100%" },
   connectionDot: { borderRadius: 4, height: 7, width: 7 },
   connectedDot: { backgroundColor: "#23a55a" },
   disconnectedDot: { backgroundColor: "#d64b4b" },

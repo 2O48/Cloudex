@@ -1,0 +1,17 @@
+{
+  "expo": {
+    "name": "Cloudex",
+    "slug": "cloudex",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "scheme": "cloudex",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.cloudex.mobile"
+    },
+    "android": {
+      "package": "com.cloudex.mobile"
+    }
+  }
+}

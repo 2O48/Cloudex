@@ -1,0 +1,26 @@
+{
+  "name": "cloudex-codex-control",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudex Codex controller monorepo: local server, shared API, and mobile app.",
+  "type": "module",
+  "workspaces": [
+    "apps/server",
+    "apps/mobile",
+    "packages/shared"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "npm run server",
+    "server": "node apps/server/src/server.js",
+    "server:dev": "node --watch apps/server/src/server.js",
+    "mobile": "npm --workspace @cloudex/mobile start",
+    "dev:all": "bash ./start-cloudex.sh",
+    "test": "node --test apps/server/test/*.test.js"
+  },
+  "dependencies": {
+    "expo": "~54.0.0"
+  }
+}

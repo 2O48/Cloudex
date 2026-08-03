@@ -1,0 +1,428 @@
+import Foundation
+
+enum ConnectionMode: String, CaseIterable, Identifiable {
+    case automatic
+    case lan
+    case tailscale
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .automatic: return "自动"
+        case .lan: return "局域网"
+        case .tailscale: return "Tailscale"
+        }
+    }
+}
+
+struct HealthResponse: Codable {
+    let ok: Bool
+    let codexConnected: Bool?
+}
+
+struct ProjectsResponse: Codable {
+    let data: [CloudexProject]
+    let total: Int?
+}
+
+struct ProjectSnapshot: Codable {
+    let projects: [CloudexProject]
+}
+
+struct ApprovalsResponse: Codable {
+    let data: [ApprovalRequest]
+}
+
+enum ApprovalDecision: String {
+    case accept
+    case acceptForSession
+    case decline
+
+    var systemTitle: String {
+        switch self {
+        case .accept: return "用户已允许操作"
+        case .acceptForSession: return "用户已永久允许当前会话"
+        case .decline: return "用户已禁止操作"
+        }
+    }
+}
+
+struct ApprovalRequest: Codable, Identifiable, Equatable {
+    let id: String
+    let method: String
+    let threadId: String?
+    let turnId: String?
+    let itemId: String?
+    let reason: String?
+    let command: String?
+    let cwd: String?
+    let grantRoot: String?
+    let networkApprovalContext: NetworkApprovalContext?
+    let availableDecisions: [String]?
+    let permissionSummary: String?
+    let requestedAt: Double?
+
+    var isFileChange: Bool { method == "item/fileChange/requestApproval" }
+    var isPermissionRequest: Bool { method == "item/permissions/requestApproval" }
+
+    func supports(_ decision: ApprovalDecision) -> Bool {
+        // Cloudex exposes the complete approval policy even when Codex omits
+        // optional decisions from availableDecisions for a specific request.
+        // Keep all three actions tappable; the server remains authoritative.
+        return true
+    }
+}
+
+struct NetworkApprovalContext: Codable, Equatable {
+    let host: String?
+    let protocolName: String?
+    let port: Int?
+
+    private enum CodingKeys: String, CodingKey {
+        case host
+        case protocolName = "protocol"
+        case port
+    }
+}
+
+struct CloudexProject: Codable, Identifiable, Equatable {
+    let id: String
+    let name: String
+    let cwd: String
+    let threads: [CloudexThread]
+    let updatedAt: Double?
+
+    var displayName: String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty && !Self.isNoProjectLikeName(trimmed) { return trimmed }
+        let components = cwd.split(separator: "/").map(String.init)
+        if let last = components.last, !Self.isNoProjectLikeName(last) { return last }
+        if components.count >= 2 {
+            return "\(components[components.count - 2]) / \(components[components.count - 1])"
+        }
+        return trimmed.isEmpty ? "未命名项目" : trimmed
+    }
+
+    var isNoProjectLike: Bool {
+        let trimmed = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed == "未指定项目目录" { return true }
+        if trimmed.contains("/Documents/Codex/") || trimmed.hasSuffix("/Documents/Codex") { return true }
+        if trimmed.contains("/.codex/") { return true }
+        return Self.isNoProjectLikeName(name)
+    }
+
+    private static func isNoProjectLikeName(_ value: String) -> Bool {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized.isEmpty || normalized == "未指定项目目录" { return true }
+        if ["bh", "bh-w", "openclaw-discord-discord"].contains(normalized) { return true }
+        let parts = normalized.split(separator: "-")
+        if parts.count >= 2 && Set(parts).count == 1 { return true }
+        return normalized.count <= 3 && normalized.range(of: #"^[a-z0-9-]+$"#, options: .regularExpression) != nil
+    }
+}
+
+struct CloudexThread: Codable, Identifiable, Equatable {
+    let id: String
+    let name: String?
+    let preview: String?
+    let cwd: String?
+    let status: ThreadStatus?
+    let model: String?
+    let createdAt: Double?
+    let updatedAt: Double?
+
+    var title: String {
+        let value = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let value, !value.isEmpty, !Self.isNoiseTitle(value) { return value }
+        let fallback = preview?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let fallback, !fallback.isEmpty { return fallback }
+        return "未命名对话"
+    }
+
+    var isActive: Bool { status?.type == "active" }
+
+    private static func isNoiseTitle(_ value: String) -> Bool {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["exec", "apply_patch", "tool", "command"].contains(normalized)
+    }
+}
+
+struct ThreadStatus: Codable, Equatable {
+    let type: String?
+    let activeFlags: [String]?
+}
+
+struct ThreadDetail: Codable {
+    let thread: CloudexThread
+    let turns: [CloudexTurn]
+}
+
+struct CloudexTurn: Codable {
+    let id: String
+    let items: [TurnItem]?
+    let status: String?
+    let error: TurnErrorPayload?
+    let startedAt: Double?
+    let completedAt: Double?
+    let durationMs: Double?
+    let compressed: Bool?
+    let itemsView: String?
+}
+
+struct TurnItem: Codable {
+    let type: String
+    let id: String?
+    let text: String?
+    let content: [TurnContent]?
+    let command: String?
+    let activity: String?
+    let status: String?
+    let exitCode: Int?
+    let duration: String?
+    let phase: String?
+    let createdAt: Double?
+    let compressed: Bool?
+    let diff: [EditDiffPayload]?
+
+    var renderedText: String {
+        if type == "userMessage" {
+            return (content ?? []).compactMap { $0.text ?? $0.value }.joined()
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let textValue = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !textValue.isEmpty { return textValue }
+        return (content ?? []).compactMap { $0.text ?? $0.value }.joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var isCompressed: Bool {
+        if compressed == true { return true }
+        let normalized = type.lowercased()
+        return normalized.contains("compressed") || normalized.contains("compaction") || normalized.contains("compact")
+    }
+}
+
+struct EditDiffPayload: Codable, Equatable, Sendable {
+    let name: String
+    let additions: Int?
+    let deletions: Int?
+    let lines: [EditDiffLinePayload]?
+}
+
+struct EditDiffLinePayload: Codable, Equatable, Identifiable, Sendable {
+    let kind: String
+    let text: String
+    let lineNumber: Int?
+
+    var id: String { "\(kind)-\(lineNumber ?? -1)-\(text)" }
+}
+
+struct TurnContent: Codable {
+    let type: String?
+    let text: String?
+    let value: String?
+}
+
+struct TurnErrorPayload: Codable {
+    let message: String
+    let code: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case message
+        case codexErrorInfo
+        case codexErrorInfoSnake = "codex_error_info"
+        case code
+        case type
+    }
+
+    init(from decoder: Decoder) throws {
+        if let container = try? decoder.singleValueContainer(),
+           let value = try? container.decode(String.self) {
+            message = value
+            code = nil
+            return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        message = (try? container.decode(String.self, forKey: .message)) ?? "任务执行失败"
+        code = (try? container.decode(String.self, forKey: .codexErrorInfo))
+            ?? (try? container.decode(String.self, forKey: .codexErrorInfoSnake))
+            ?? (try? container.decode(String.self, forKey: .code))
+            ?? (try? container.decode(String.self, forKey: .type))
+    }
+
+    var displayText: String {
+        [message, code.map { "错误代码：\($0)" }].compactMap { $0 }.joined(separator: "\n")
+    }
+
+    private enum EncodingKeys: String, CodingKey {
+        case message
+        case codexErrorInfo = "codexErrorInfo"
+        case codexErrorInfoSnake = "codex_error_info"
+        case code
+        case type
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: EncodingKeys.self)
+        try container.encode(message, forKey: .message)
+        try container.encodeIfPresent(code, forKey: .codexErrorInfo)
+    }
+}
+
+struct ModelsResponse: Codable {
+    let data: [CodexModel]
+}
+
+struct CodexModel: Codable, Equatable {
+    let rawID: String?
+    let model: String?
+    let displayName: String?
+    let hidden: Bool?
+    let isDefault: Bool?
+    let supportedReasoningEfforts: [ReasoningEffortOption]?
+    let defaultReasoningEffort: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case rawID = "id"
+        case model
+        case displayName
+        case hidden
+        case isDefault
+        case supportedReasoningEfforts
+        case defaultReasoningEffort
+    }
+
+    var identifier: String { rawID ?? model ?? displayName ?? "unknown" }
+    var title: String { displayName ?? model ?? rawID ?? "未知模型" }
+}
+
+struct ReasoningEffortOption: Codable, Equatable, Identifiable {
+    let reasoningEffort: String
+    let description: String?
+
+    var id: String { reasoningEffort }
+
+    var title: String {
+        switch reasoningEffort {
+        case "low": return "低"
+        case "medium": return "中"
+        case "high": return "高"
+        case "xhigh": return "超高"
+        case "max": return "最大"
+        case "ultra": return "极限"
+        default: return reasoningEffort
+        }
+    }
+}
+
+struct CreateThreadResponse: Codable {
+    let thread: CloudexThread
+}
+
+struct EmptyResponse: Codable {}
+
+struct ApprovalResponse: Codable {
+    let ok: Bool
+}
+
+struct RemoteFilesResponse: Codable {
+    let path: String
+    let entries: [RemoteFileEntry]
+}
+
+struct RemoteFileEntry: Codable, Identifiable, Hashable {
+    let name: String
+    let path: String
+    let type: String
+    let size: Double?
+    let modifiedAt: String?
+    let selectable: Bool?
+
+    var id: String { path }
+    var isDirectory: Bool { type == "directory" }
+}
+
+struct ChatMessage: Identifiable, Equatable {
+    enum Role: String {
+        case user
+        case assistant
+        case error
+        case system
+        case execution
+        case processSummary
+        case compressed
+        case taskSummary
+    }
+
+    let id: String
+    let role: Role
+    let text: String
+    var executionStatus: String? = nil
+    var executionDuration: String? = nil
+    var executionExitCode: Int? = nil
+    var executionKind: String? = nil
+    var editDiff: [EditDiffPayload]? = nil
+    var processItems: [ChatMessage]? = nil
+    var createdAt: Double? = nil
+    var isCompressed: Bool = false
+    var threadID: String? = nil
+}
+
+struct SSEEvent {
+    let id: String?
+    let name: String
+    let data: Data
+}
+
+enum DateFormatting {
+    static let formatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    static let messageFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    static func string(from timestamp: Double?) -> String {
+        guard let timestamp, timestamp > 0 else { return "" }
+        return formatter.string(from: Date(timeIntervalSince1970: timestamp))
+    }
+
+    static func messageTime(from timestamp: Double?) -> String {
+        guard let timestamp, timestamp > 0 else { return "" }
+        return messageFormatter.string(from: Date(timeIntervalSince1970: timestamp))
+    }
+
+    static func duration(fromMilliseconds milliseconds: Double?) -> String {
+        guard let milliseconds, milliseconds >= 0 else { return "" }
+        return duration(fromSeconds: milliseconds / 1000)
+    }
+
+    static func duration(fromSeconds seconds: Double?) -> String {
+        guard let seconds, seconds >= 0 else { return "" }
+        let rounded = Int(seconds.rounded())
+        if rounded < 60 { return "\(rounded)秒" }
+        let minutes = rounded / 60
+        let remainingSeconds = rounded % 60
+        if minutes < 60 {
+            return remainingSeconds == 0 ? "\(minutes)分" : "\(minutes)分\(remainingSeconds)秒"
+        }
+        let hours = minutes / 60
+        let remainingMinutes = minutes % 60
+        if remainingMinutes == 0 { return "\(hours)小时" }
+        return "\(hours)小时\(remainingMinutes)分"
+    }
+}
+
+extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
+    }
+}

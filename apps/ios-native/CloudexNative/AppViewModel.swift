@@ -20,6 +20,7 @@ final class AppViewModel: ObservableObject {
     @Published var status = "未连接"
     @Published var isServerReachable = false
     @Published var isBusy = false
+    @Published var isOpeningThread = false
     @Published var isCreatingNew = false
     @Published var liveMessages: [ChatMessage] = [] { didSet { rebuildRenderedMessages() } }
     @Published var liveRunning = false
@@ -43,6 +44,7 @@ final class AppViewModel: ObservableObject {
     private var started = false
     private var streamsStarted = false
     private var lastThreadEventID = 0
+    private var threadStreamReplaying = false
     private var detailLoadGeneration = 0
     private var liveMessageTurnIDs: [String: String] = [:]
     private var activeTurnNotificationKeys: [String: String] = [:]
@@ -110,12 +112,13 @@ final class AppViewModel: ObservableObject {
     }
     var visibleApprovals: [ApprovalRequest] {
         guard let selectedThreadID else { return pendingApprovals }
-        return pendingApprovals.sorted { left, right in
-            let leftMatches = left.threadId == nil || left.threadId == selectedThreadID
-            let rightMatches = right.threadId == nil || right.threadId == selectedThreadID
-            if leftMatches != rightMatches { return leftMatches }
-            return (left.requestedAt ?? 0) < (right.requestedAt ?? 0)
-        }
+        return pendingApprovals
+            .filter { approval in
+                approval.threadId == nil || approval.threadId == selectedThreadID
+            }
+            .sorted { left, right in
+                (left.requestedAt ?? 0) < (right.requestedAt ?? 0)
+            }
     }
 
     var navigationTitle: String {
@@ -825,6 +828,8 @@ final class AppViewModel: ObservableObject {
     }
 
     func openThread(_ thread: CloudexThread, projectCWD: String?) async {
+        isOpeningThread = true
+        defer { isOpeningThread = false }
         selectedProjectCWD = projectCWD
         selectedThreadID = thread.id
         isCreatingNew = false
@@ -1150,10 +1155,14 @@ final class AppViewModel: ObservableObject {
     private func connectThreadStream(threadID: String) {
         threadSSE.stop()
         lastThreadEventID = 0
+        threadStreamReplaying = true
         do {
             let url = try client.makeURL(path: client.threadPath(threadID, action: "stream"))
             threadSSE.onEvent = { [weak self] event in
                 Task { @MainActor in self?.handleThreadEvent(event, expectedThreadID: threadID) }
+            }
+            threadSSE.onOpen = { [weak self] in
+                Task { @MainActor in self?.threadStreamReplaying = true }
             }
             threadSSE.onDisconnect = { [weak self] message in
                 Task { @MainActor in
@@ -1263,6 +1272,10 @@ final class AppViewModel: ObservableObject {
             guard id > lastThreadEventID else { return }
             lastThreadEventID = id
         }
+        if event.name == "replay-complete" {
+            threadStreamReplaying = false
+            return
+        }
         if event.name == "error" {
             let object = (try? JSONSerialization.jsonObject(with: event.data)) as? [String: Any]
             status = "实时订阅失败：\(object?["message"] as? String ?? "未知错误")"
@@ -1275,7 +1288,9 @@ final class AppViewModel: ObservableObject {
 
         if method == "turn/started" {
             liveRunning = true
-            let turnID = params["turnId"] as? String ?? UUID().uuidString
+            let turnID = params["turnId"] as? String
+                ?? (params["turn"] as? [String: Any])?["id"] as? String
+                ?? UUID().uuidString
             activeTurnNotificationKeys[expectedThreadID] = turnID
             clearLiveMessages()
             localError = nil
@@ -1364,6 +1379,7 @@ final class AppViewModel: ObservableObject {
         success: Bool,
         detail: String? = nil
     ) {
+        guard !threadStreamReplaying else { return }
         let turnID = params["turnId"] as? String
             ?? (params["turn"] as? [String: Any])?["id"] as? String
         let key = activeTurnNotificationKeys[threadID]
@@ -1393,7 +1409,11 @@ final class AppViewModel: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))
                 guard let self, self.selectedThreadID == threadID else { return }
-                await self.loadThread(threadID, force: true)
+                // SSE owns all live task updates. Replacing the complete
+                // thread snapshot every two seconds makes long LazyVStacks
+                // recalculate row heights and shifts the user's viewport.
+                // The completion event performs one final forced reload.
+                await self.loadThread(threadID)
             }
         }
     }

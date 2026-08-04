@@ -7,13 +7,14 @@ struct ContentView: View {
     let expectedThreadID: String?
     @State private var showingSettings = false
     @State private var showingFilePicker = false
+    @State private var didInitialScroll = false
     @State private var isAtChatBottom = true
     @State private var scrollToBottomRequest = 0
+    @State private var messageJumpSnapshot: [MessageJumpItem] = []
+    @State private var scrollTargetMessageID: String?
+    @State private var stableMessages: [ChatMessage] = []
     @State private var collapseProcessRequest = 0
     @State private var floatingCollapseVisible = false
-    @State private var scrollTargetMessageID: String?
-    @State private var suppressAutomaticScroll = false
-    @State private var messageJumpSnapshot: [MessageJumpItem] = []
     @State private var showingTokenUsage = false
     @FocusState private var composerFocused: Bool
     @State private var keyboardHeight: CGFloat = 0
@@ -65,10 +66,6 @@ struct ContentView: View {
                     .liquidGlass(in: Circle(), interactive: true)
                     .shadow(color: .black.opacity(0.1), radius: 10, y: 4)
                     .padding(.bottom, 6)
-                    // The composer extends into the bottom safe area when
-                    // the keyboard is hidden; keep this button aligned with
-                    // the composer's visible bottom edge.
-                    .offset(y: keyboardHeight > 0 ? 0 : 7)
                     .transition(.scale.combined(with: .opacity))
                     .accessibilityLabel("滚动到最新消息")
                 }
@@ -79,11 +76,11 @@ struct ContentView: View {
         .ignoresSafeArea(.keyboard, edges: .top)
         .toolbar {
             ToolbarItem(placement: .principal) {
-                MessageJumpSystemMenu(
-                    messages: messageJumpSnapshot,
+                ChatNavigationTitle(
                     title: viewModel.navigationTitle,
                     projectTitle: viewModel.projectTitle,
                     isConnected: viewModel.isConnected,
+                    messages: messageJumpSnapshot,
                     onSelect: { scrollTargetMessageID = $0.id }
                 )
                 .equatable()
@@ -94,9 +91,6 @@ struct ContentView: View {
                 }
                 .accessibilityLabel("打开设置")
             }
-        }
-        .onChange(of: viewModel.messageIndex, initial: true) { _, items in
-            messageJumpSnapshot = items.map(MessageJumpItem.init)
         }
         .sheet(isPresented: $showingSettings) {
             SettingsView(isPresented: $showingSettings)
@@ -114,6 +108,19 @@ struct ContentView: View {
         .sheet(isPresented: $showingTokenUsage) {
             TokenUsageSheet(usage: viewModel.selectedThread?.usage)
                 .presentationDetents([.medium])
+        }
+        .onChange(of: viewModel.messageIndex, initial: true) { _, items in
+            messageJumpSnapshot = items.map(MessageJumpItem.init)
+        }
+        .onChange(of: viewModel.isOpeningThread, initial: true) { _, opening in
+            guard !opening else { return }
+            stableMessages = viewModel.renderedMessages
+        }
+        .onChange(of: viewModel.detail) { _, _ in
+            // Keep history immutable while a task is streaming. The final
+            // completed snapshot replaces it once, after the task ends.
+            guard !viewModel.liveRunning else { return }
+            stableMessages = viewModel.renderedMessages
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
             guard let value = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue else { return }
@@ -145,10 +152,10 @@ struct ContentView: View {
 
     private var chat: some View {
         ScrollViewReader { proxy in
-            trackedChatScrollView {
+            ScrollView {
                 let isNewChat = expectedThreadID?.hasPrefix("new-") == true
                 let isReady = isNewChat || expectedThreadID == viewModel.selectedThreadID
-                let messages = isReady ? viewModel.renderedMessages : []
+                let messages = isReady ? displayedMessages : []
                 LazyVStack(spacing: 12) {
                     if !isReady {
                         ProgressView("正在打开对话…")
@@ -206,70 +213,42 @@ struct ContentView: View {
                             .padding(.vertical, 8)
                     }
 
-                    Color.clear.frame(height: 1).id("chat-bottom")
+                    // The scroll target must be at the true end of the scroll
+                    // content, after the space reserved for the overlaid
+                    // composer. Otherwise scrolling to it moves the content
+                    // downward and reveals older messages.
+                    Color.clear
+                        .frame(height: viewModel.attachedFiles.isEmpty ? 144 : 188)
+                        .id("chat-bottom")
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 16)
-                // Keep the scroll target above the composer, its model/effort
-                // row, and the optional attachment row.
-                .padding(.bottom, viewModel.attachedFiles.isEmpty ? 144 : 188)
             }
-            .onAppear {
-                scrollToBottom(proxy, animated: false)
-            }
-            .onChange(of: viewModel.selectedThreadID) { _, _ in
-                scrollToBottom(proxy, animated: false)
-            }
-            .onChange(of: viewModel.renderedMessages.count) { _, _ in
-                if isAtChatBottom && !suppressAutomaticScroll { scrollToBottom(proxy, animated: false) }
-            }
-            .onChange(of: viewModel.liveMessages) { _, _ in
-                if isAtChatBottom && !suppressAutomaticScroll { scrollToBottom(proxy, animated: false) }
-            }
-            .onChange(of: viewModel.visibleApprovals.count) { _, _ in
-                if isAtChatBottom && !suppressAutomaticScroll { scrollToBottom(proxy, animated: false) }
+            .scrollDisabled(viewModel.isOpeningThread)
+            .scrollDismissesKeyboard(.interactively)
+            .trackChatBottom($isAtChatBottom)
+            // This is the sole automatic positioning: open a conversation at
+            // its latest loaded message once. Subsequent updates are left to
+            // the native scroll view and the user's own gestures.
+            .onChange(of: initialScrollContentID, initial: true) { _, lastMessageID in
+                guard lastMessageID != nil, !didInitialScroll else { return }
+                didInitialScroll = true
+                DispatchQueue.main.async {
+                    proxy.scrollTo("chat-bottom", anchor: .bottom)
+                }
             }
             .onChange(of: scrollToBottomRequest) { _, _ in
-                scrollToBottom(proxy, animated: false)
+                proxy.scrollTo("chat-bottom", anchor: .bottom)
             }
-            .onChange(of: scrollTargetMessageID) { _, id in
-                guard let id else { return }
-                suppressAutomaticScroll = true
-                isAtChatBottom = false
-                withAnimation(.easeInOut(duration: 0.25)) {
-                    proxy.scrollTo(id, anchor: .top)
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+            .onChange(of: scrollTargetMessageID) { _, messageID in
+                guard let messageID else { return }
+                proxy.scrollTo(messageID, anchor: .top)
+                DispatchQueue.main.async {
                     scrollTargetMessageID = nil
-                    suppressAutomaticScroll = false
                 }
             }
         }
         .frame(maxHeight: .infinity)
-    }
-
-    @ViewBuilder
-    private func trackedChatScrollView<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        if #available(iOS 18.0, *) {
-            ScrollView {
-                content()
-            }
-            .scrollDismissesKeyboard(.interactively)
-            .onScrollGeometryChange(for: Bool.self) { geometry in
-                let visibleBottom = geometry.contentOffset.y + geometry.containerSize.height
-                let distanceToBottom = geometry.contentSize.height - visibleBottom
-                // Allow a small amount of movement at the bottom without
-                // treating the user as having intentionally scrolled away.
-                return geometry.contentSize.height <= geometry.containerSize.height || distanceToBottom <= 24
-            } action: { _, atBottom in
-                isAtChatBottom = atBottom
-            }
-        } else {
-            ScrollView {
-                content()
-            }
-            .scrollDismissesKeyboard(.interactively)
-        }
     }
 
     private var composer: some View {
@@ -443,14 +422,19 @@ struct ContentView: View {
         }
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
-        DispatchQueue.main.async {
-            if animated {
-                withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("chat-bottom", anchor: .bottom) }
-            } else {
-                proxy.scrollTo("chat-bottom", anchor: .bottom)
-            }
-        }
+    private var initialScrollContentID: String? {
+        let isNewChat = expectedThreadID?.hasPrefix("new-") == true
+        guard isNewChat || expectedThreadID == viewModel.selectedThreadID else { return nil }
+        return viewModel.renderedMessages.last?.id
+    }
+
+    private var displayedMessages: [ChatMessage] {
+        guard !stableMessages.isEmpty else { return viewModel.renderedMessages }
+        let liveByID = Dictionary(uniqueKeysWithValues: viewModel.liveMessages.map { ($0.id, $0) })
+        var displayed = stableMessages.map { liveByID[$0.id] ?? $0 }
+        let existingIDs = Set(displayed.map(\.id))
+        displayed.append(contentsOf: viewModel.liveMessages.filter { !existingIDs.contains($0.id) })
+        return displayed
     }
 
     private func threadStatus(_ thread: CloudexThread) -> String {
@@ -468,6 +452,23 @@ struct ContentView: View {
         let remaining = max(0, window - used)
         let percent = Int((Double(remaining) / Double(max(1, window)) * 100).rounded())
         return "余 \(percent)%"
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func trackChatBottom(_ isAtBottom: Binding<Bool>) -> some View {
+        if #available(iOS 18.0, *) {
+            self.onScrollGeometryChange(for: Bool.self) { geometry in
+                let visibleBottom = geometry.contentOffset.y + geometry.containerSize.height
+                let distanceToBottom = geometry.contentSize.height - visibleBottom
+                return geometry.contentSize.height <= geometry.containerSize.height || distanceToBottom <= 24
+            } action: { _, atBottom in
+                isAtBottom.wrappedValue = atBottom
+            }
+        } else {
+            self
+        }
     }
 }
 
@@ -1295,18 +1296,18 @@ private struct ApprovalBubble: View {
     }
 }
 
-private struct MessageJumpSystemMenu: View, Equatable {
-    let messages: [MessageJumpItem]
+private struct ChatNavigationTitle: View, Equatable {
     let title: String
     let projectTitle: String
     let isConnected: Bool
+    let messages: [MessageJumpItem]
     let onSelect: (MessageJumpItem) -> Void
 
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.messages == rhs.messages &&
         lhs.title == rhs.title &&
         lhs.projectTitle == rhs.projectTitle &&
-        lhs.isConnected == rhs.isConnected
+        lhs.isConnected == rhs.isConnected &&
+        lhs.messages == rhs.messages
     }
 
     var body: some View {
@@ -1321,7 +1322,6 @@ private struct MessageJumpSystemMenu: View, Equatable {
                         Text("\(message.roleTitle) · \(message.text)")
                             .lineLimit(1)
                     }
-                    .id("jump-menu-\(message.id)")
                 }
             }
         } label: {
@@ -1341,9 +1341,6 @@ private struct MessageJumpSystemMenu: View, Equatable {
                         .lineLimit(1)
                 }
             }
-            // Keep the glass capsule below the navigation bar's clipping edges.
-            // Menu presentation/dismissal briefly re-lays out the principal
-            // item, and a capsule at the full 44pt bar height gets cropped.
             .frame(maxWidth: 190)
             .frame(height: 36)
             .padding(.horizontal, 15)
@@ -1352,22 +1349,20 @@ private struct MessageJumpSystemMenu: View, Equatable {
             .shadow(color: .black.opacity(0.08), radius: 14, y: 5)
             .padding(.vertical, 4)
         }
-        .tint(.primary)
+        .buttonStyle(.plain)
+        .accessibilityLabel("打开消息菜单")
     }
-
 }
 
 private struct MessageJumpItem: Identifiable, Equatable {
     let id: String
-    let turnID: String
     let roleTitle: String
     let text: String
 
     init(item: MessageIndexItem) {
         id = item.id
-        turnID = item.turnId
         roleTitle = item.role == "user" ? "你" : "Codex"
-        text = item.text.isEmpty ? "（空消息）" : item.text
+        text = item.text
     }
 }
 

@@ -224,6 +224,11 @@ private struct SystemSearchField: UIViewRepresentable {
         }
 
         func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
+            // During Chinese/Japanese/Korean IME composition UISearchBar sends
+            // textDidChange for the unfinished marked (拼音) text. Do not use
+            // that temporary text to filter conversations until composition
+            // has been committed.
+            guard searchBar.searchTextField.markedTextRange == nil else { return }
             parent.text = searchText
         }
 

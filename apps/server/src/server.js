@@ -695,6 +695,8 @@ async function handle(req, res, url) {
     const cleanup = subscribe(threadId, res);
     writeSse(res, "ready", { threadId, mode: "api-only" });
     replayEvents(threadId, res);
+    // Let clients distinguish replayed history from newly arriving events.
+    writeSse(res, "replay-complete", { threadId });
     try {
       await client.subscribeThread(threadId);
       writeSse(res, "subscribed", { threadId });

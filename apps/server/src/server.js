@@ -5,6 +5,12 @@ import path from "node:path";
 import { config } from "./config.js";
 import { CodexClient, CodexError } from "./codex-client.js";
 import { archiveCliThread, listCliThreads, readCliThreadById } from "./cli-sessions.js";
+import {
+  isWindowsPlatform,
+  resumeThread as resumeWindowsThread,
+  startNewThread as startWindowsThread,
+  stopThread as stopWindowsThread,
+} from "./windows-cli.js";
 import { printConnectionQRCode } from "./connection-qr.js";
 import { normalizeAllowedPath } from "./file-roots.js";
 
@@ -152,6 +158,10 @@ function normalizeModel(model) {
     supportedReasoningEfforts,
     hidden: model.hidden ?? model.visibility === "hide",
   };
+}
+
+function usesWindowsCliFallback() {
+  return isWindowsPlatform() && (!client.socket || client.socket.closed);
 }
 
 function normalizeModelsResponse(result) {
@@ -783,8 +793,10 @@ async function syncThreads(reason = "manual") {
   syncInFlight = true;
   try {
     const threads = await listAllThreads(false);
-    const runningThreads = threads.filter((thread) => thread.status?.type === "active");
-    await Promise.allSettled(runningThreads.map((thread) => client.subscribeThread(thread.id)));
+    if (!usesWindowsCliFallback()) {
+      const runningThreads = threads.filter((thread) => thread.status?.type === "active");
+      await Promise.allSettled(runningThreads.map((thread) => client.subscribeThread(thread.id)));
+    }
     const signature = threadSignature(threads);
     if (signature !== latestThreadSignature) {
       latestThreadSignature = signature;
@@ -1013,11 +1025,17 @@ async function handle(req, res, url) {
     replayEvents(threadId, res);
     // Let clients distinguish replayed history from newly arriving events.
     writeSse(res, "replay-complete", { threadId });
-    try {
-      await client.subscribeThread(threadId);
-      writeSse(res, "subscribed", { threadId });
-    } catch (error) {
-      writeSse(res, "error", { message: error.message || "Unable to subscribe to Codex task" });
+    if (usesWindowsCliFallback()) {
+      writeSse(res, "error", {
+        message: "Live streaming is unavailable on Windows; the app will poll for updates",
+      });
+    } else {
+      try {
+        await client.subscribeThread(threadId);
+        writeSse(res, "subscribed", { threadId });
+      } catch (error) {
+        writeSse(res, "error", { message: error.message || "Unable to subscribe to Codex task" });
+      }
     }
     const keepAlive = setInterval(() => res.write(": keep-alive\n\n"), 15000);
     res.on("close", () => { clearInterval(keepAlive); cleanup(); });
@@ -1027,28 +1045,42 @@ async function handle(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/threads") {
     const data = await body(req);
     const cwd = await normalizeThreadCwd(data.cwd || config.defaultCwd);
-    const params = {
-      cwd,
-      model: data.model || null,
-      sandbox: data.sandbox || "workspace-write",
-      approvalPolicy: data.approvalPolicy || "on-request",
-      personality: data.personality || null,
-    };
-    const result = await client.request("thread/start", params);
-    const thread = result.thread || result;
-    // thread/start automatically subscribes this app-server connection. Record
-    // that fact immediately so a phone opening the new thread does not issue a
-    // redundant thread/resume before its first rollout has been persisted.
-    client.markThreadSubscribed(thread.id);
+    let thread = null;
     let turn = null;
-    if (data.prompt) {
-      const turnResult = await client.request("turn/start", {
-        threadId: thread.id,
-        input: await inputFrom({ message: data.prompt, files: data.files }),
+    if (usesWindowsCliFallback()) {
+      const threadId = await startWindowsThread({
+        cwd,
+        prompt: data.prompt,
+        files: data.files,
         model: data.model || null,
         effort: data.effort || null,
+        sandbox: data.sandbox || "workspace-write",
+        approvalPolicy: data.approvalPolicy || "on-request",
       });
-      turn = turnResult.turn || turnResult;
+      thread = (await readCliThreadById(threadId)).thread;
+    } else {
+      const params = {
+        cwd,
+        model: data.model || null,
+        sandbox: data.sandbox || "workspace-write",
+        approvalPolicy: data.approvalPolicy || "on-request",
+        personality: data.personality || null,
+      };
+      const result = await client.request("thread/start", params);
+      thread = result.thread || result;
+      // thread/start automatically subscribes this app-server connection. Record
+      // that fact immediately so a phone opening the new thread does not issue a
+      // redundant thread/resume before its first rollout has been persisted.
+      client.markThreadSubscribed(thread.id);
+      if (data.prompt) {
+        const turnResult = await client.request("turn/start", {
+          threadId: thread.id,
+          input: await inputFrom({ message: data.prompt, files: data.files }),
+          model: data.model || null,
+          effort: data.effort || null,
+        });
+        turn = turnResult.turn || turnResult;
+      }
     }
     scheduleThreadSync("thread-created", 100);
     return json(res, 201, { thread, turn });
@@ -1060,17 +1092,41 @@ async function handle(req, res, url) {
     const action = threadMatch[2];
     if (req.method === "POST" && action === "message") {
       const data = await body(req);
-      const resume = await client.subscribeThread(threadId);
-      const turnResult = await client.request("turn/start", {
-        threadId,
-        input: await inputFrom(data),
-        model: data.model || null,
-        effort: data.effort || null,
-      });
+      let thread = null;
+      let turn = null;
+      if (usesWindowsCliFallback()) {
+        const input = await inputFrom(data);
+        const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
+        const images = input.filter((part) => part.type === "localImage");
+        await resumeWindowsThread({
+          threadId,
+          prompt,
+          files: images,
+          model: data.model || null,
+          effort: data.effort || null,
+          sandbox: data.sandbox || "workspace-write",
+          approvalPolicy: data.approvalPolicy || "on-request",
+        });
+      } else {
+        const resume = await client.subscribeThread(threadId);
+        const turnResult = await client.request("turn/start", {
+          threadId,
+          input: await inputFrom(data),
+          model: data.model || null,
+          effort: data.effort || null,
+        });
+        thread = resume?.thread || resume || null;
+        turn = turnResult.turn || turnResult;
+      }
       scheduleThreadSync("message-sent", 100);
-      return json(res, 202, { thread: resume?.thread || resume || null, turn: turnResult.turn || turnResult });
+      return json(res, 202, { thread, turn });
     }
     if (req.method === "POST" && action === "fork") {
+      if (usesWindowsCliFallback()) {
+        const error = new Error("Fork is not supported on Windows CLI mode");
+        error.status = 501;
+        throw error;
+      }
       const data = await body(req);
       const turnId = String(data.turnId || "").trim();
       if (!turnId) {
@@ -1100,6 +1156,16 @@ async function handle(req, res, url) {
       return json(res, 201, { thread: forkedThread, turn });
     }
     if (req.method === "POST" && action === "stop") {
+      if (usesWindowsCliFallback()) {
+        const stopped = stopWindowsThread(threadId);
+        if (!stopped) {
+          const error = new Error("No active turn for this thread");
+          error.status = 409;
+          throw error;
+        }
+        scheduleThreadSync("turn-stopped", 100);
+        return json(res, 200, { stopped: true, threadId, turnId: null, source: "windows-cli" });
+      }
       const { turnId, source, thread } = await resolveActiveTurn(threadId);
       if (!turnId) {
         const status = thread?.status?.type ? ` (${thread.status.type})` : "";

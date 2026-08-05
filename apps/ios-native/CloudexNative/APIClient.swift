@@ -70,6 +70,23 @@ struct APIClient {
         return try await send(request)
     }
 
+    func download(_ path: String, queryItems: [URLQueryItem] = []) async throws -> Data {
+        var request = URLRequest(url: try makeURL(path: path, queryItems: queryItems))
+        request.httpMethod = "GET"
+        request.timeoutInterval = 30
+        if !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw APIClientError.invalidResponse }
+        guard (200..<300).contains(http.statusCode) else {
+            let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let message = object?["error"] as? String ?? String(data: data, encoding: .utf8) ?? ""
+            throw APIClientError.server(status: http.statusCode, message: message)
+        }
+        return data
+    }
+
     private func send<T: Decodable>(_ requestValue: URLRequest) async throws -> T {
         var request = requestValue
         request.timeoutInterval = 6

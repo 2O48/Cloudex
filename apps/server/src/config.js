@@ -3,7 +3,19 @@ import path from "node:path";
 import crypto from "node:crypto";
 import fs from "node:fs";
 
-const standaloneCodexBin = path.join(os.homedir(), ".codex", "packages", "standalone", "current", "codex");
+const standaloneCodexBin = path.join(os.homedir(), ".codex", "packages", "standalone", "current", "bin", "codex");
+function codexFromPath() {
+  const executable = process.platform === "win32" ? "codex.exe" : "codex";
+  for (const directory of (process.env.PATH || "").split(path.delimiter)) {
+    if (!directory) continue;
+    const candidate = path.join(directory, executable);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {}
+  }
+  return null;
+}
 function windowsCodexBin() {
   if (process.platform !== "win32") return null;
   const root = path.join(os.homedir(), "AppData", "Local", "OpenAI", "Codex", "bin");
@@ -19,8 +31,11 @@ function windowsCodexBin() {
 }
 
 const defaultCodexBin = process.env.CODEX_BIN
-  || process.env.CODEX_CLI_PATH
+  || codexFromPath()
   || (fs.existsSync(standaloneCodexBin) ? standaloneCodexBin : null)
+  // Desktop exports CODEX_CLI_PATH into child shells. Keep it as a final
+  // fallback so a real CLI on PATH remains authoritative for Cloudex.
+  || process.env.CODEX_CLI_PATH
   || windowsCodexBin()
   || "codex";
 
@@ -36,6 +51,8 @@ export const config = {
   port: Number(process.env.PORT || 8787),
   authToken,
   codexBin: process.env.CODEX_BIN || defaultCodexBin,
+  codexConfigPath: process.env.CODEX_CONFIG_PATH
+    || path.join(os.homedir(), ".codex", "config.toml"),
   historySource: process.env.CLOUDEX_HISTORY_SOURCE || "cli-local",
   includeSubagents: process.env.CLOUDEX_INCLUDE_SUBAGENTS === "true",
   activeStaleSeconds: Number(process.env.CLOUDEX_ACTIVE_STALE_SECONDS || 4 * 60 * 60),

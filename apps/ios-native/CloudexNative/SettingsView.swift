@@ -1,4 +1,6 @@
+import AVFoundation
 import SwiftUI
+import UIKit
 
 struct SettingsView: View {
     @EnvironmentObject private var viewModel: AppViewModel
@@ -72,7 +74,7 @@ struct SettingsView: View {
                                         Text(item.serverURL)
                                             .lineLimit(1)
                                             .truncationMode(.middle)
-                                        Text("Token (item.maskedToken) · \(item.connectionMode.title)")
+                                        Text("Token \(item.maskedToken) · \(item.connectionMode.title)")
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
                                     }
@@ -154,5 +156,148 @@ struct SettingsView: View {
                 notifyTaskFailure = viewModel.notifyTaskFailure
             }
         }
+    }
+}
+
+struct CloudexConnectionPayload {
+    let serverURL: String
+    let token: String
+
+    init?(code: String) {
+        guard let components = URLComponents(string: code),
+              components.scheme?.lowercased() == "cloudex",
+              components.host?.lowercased() == "connect",
+              let serverURL = components.queryItems?.first(where: { $0.name == "url" })?.value,
+              let parsedServerURL = URL(string: serverURL),
+              ["http", "https"].contains(parsedServerURL.scheme?.lowercased() ?? ""),
+              parsedServerURL.host != nil else { return nil }
+
+        self.serverURL = serverURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        token = components.queryItems?.first(where: { $0.name == "token" })?.value ?? ""
+    }
+
+    var preferredConnectionMode: ConnectionMode {
+        guard let host = URL(string: serverURL)?.host?.lowercased() else { return .lan }
+        if host.hasSuffix(".ts.net") { return .tailscale }
+        let parts = host.split(separator: ".").compactMap { Int($0) }
+        if parts.count == 4, parts[0] == 100, (64...127).contains(parts[1]) { return .tailscale }
+        return .lan
+    }
+}
+
+struct QRCodeScannerView: UIViewControllerRepresentable {
+    let onScan: (String) -> Void
+    let onFailure: (String) -> Void
+
+    func makeUIViewController(context: Context) -> QRCodeScannerViewController {
+        let controller = QRCodeScannerViewController()
+        controller.onScan = onScan
+        controller.onFailure = onFailure
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: QRCodeScannerViewController, context: Context) {}
+
+    static func dismantleUIViewController(_ uiViewController: QRCodeScannerViewController, coordinator: ()) {
+        uiViewController.stopScanning()
+    }
+}
+
+final class QRCodeScannerViewController: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
+    var onScan: ((String) -> Void)?
+    var onFailure: ((String) -> Void)?
+
+    private let captureSession = AVCaptureSession()
+    private var previewLayer: AVCaptureVideoPreviewLayer?
+    private var isConfigured = false
+    private var didFinish = false
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        requestAccessAndStart()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        previewLayer?.frame = view.bounds
+    }
+
+    func stopScanning() {
+        if captureSession.isRunning { captureSession.stopRunning() }
+    }
+
+    private func requestAccessAndStart() {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            configureAndStart()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                DispatchQueue.main.async {
+                    if granted {
+                        self?.configureAndStart()
+                    } else {
+                        self?.fail("请在系统设置中允许 Cloudex 使用相机。")
+                    }
+                }
+            }
+        case .denied, .restricted:
+            fail("请在系统设置中允许 Cloudex 使用相机。")
+        @unknown default:
+            fail("当前设备无法使用相机扫描二维码。")
+        }
+    }
+
+    private func configureAndStart() {
+        if !isConfigured {
+            guard let camera = AVCaptureDevice.default(for: .video),
+                  let input = try? AVCaptureDeviceInput(device: camera),
+                  captureSession.canAddInput(input) else {
+                fail("当前设备没有可用的相机。")
+                return
+            }
+            captureSession.addInput(input)
+
+            let output = AVCaptureMetadataOutput()
+            guard captureSession.canAddOutput(output) else {
+                fail("无法启动二维码扫描。")
+                return
+            }
+            captureSession.addOutput(output)
+            output.setMetadataObjectsDelegate(self, queue: .main)
+            output.metadataObjectTypes = [.qr]
+
+            let layer = AVCaptureVideoPreviewLayer(session: captureSession)
+            layer.videoGravity = .resizeAspectFill
+            view.layer.insertSublayer(layer, at: 0)
+            previewLayer = layer
+            isConfigured = true
+            view.setNeedsLayout()
+        }
+
+        if !captureSession.isRunning { captureSession.startRunning() }
+    }
+
+    private func fail(_ message: String) {
+        guard !didFinish else { return }
+        didFinish = true
+        onFailure?(message)
+    }
+
+    func metadataOutput(
+        _ output: AVCaptureMetadataOutput,
+        didOutput metadataObjects: [AVMetadataObject],
+        from connection: AVCaptureConnection
+    ) {
+        guard !didFinish,
+              let object = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
+              let value = object.stringValue else { return }
+        didFinish = true
+        stopScanning()
+        onScan?(value)
     }
 }

@@ -5,6 +5,8 @@ import path from "node:path";
 import { config } from "./config.js";
 import { CodexClient, CodexError } from "./codex-client.js";
 import { archiveCliThread, listCliThreads, readCliThreadById } from "./cli-sessions.js";
+import { printConnectionQRCode } from "./connection-qr.js";
+import { normalizeAllowedPath } from "./file-roots.js";
 
 const client = new CodexClient();
 const subscribers = new Map();
@@ -14,6 +16,10 @@ const pendingApprovals = new Map();
 const EVENT_HISTORY_LIMIT = 250;
 const MODELS_CACHE_FILE = process.env.CLOUDEX_MODELS_CACHE
   || path.join(os.homedir(), ".codex", "models_cache.json");
+const APPROVAL_HISTORY_FILE = path.join(config.stateDir, "approval-history.json");
+let approvalHistory = null;
+let approvalHistoryLoadPromise = null;
+let approvalHistoryWrite = Promise.resolve();
 let eventSequence = 0;
 let latestThreadSignature = "";
 let latestProjectSnapshot = null;
@@ -21,6 +27,94 @@ let syncInFlight = false;
 let syncAgainReason = null;
 let syncTimer = null;
 let syncInterval = null;
+
+async function loadApprovalHistory() {
+  if (approvalHistory) return approvalHistory;
+  if (!approvalHistoryLoadPromise) {
+    approvalHistoryLoadPromise = (async () => {
+      try {
+        const value = JSON.parse(await fs.readFile(APPROVAL_HISTORY_FILE, "utf8"));
+        approvalHistory = Array.isArray(value) ? value : [];
+      } catch {
+        approvalHistory = [];
+      }
+      return approvalHistory;
+    })();
+  }
+  return approvalHistoryLoadPromise;
+}
+
+function approvalResolutionText(approval, decision) {
+  const title = decision === "decline"
+    ? "用户已禁止操作"
+    : (decision === "acceptForSession" ? "用户已永久允许当前会话" : "用户已允许操作");
+  const details = [];
+  if (approval.reason) details.push(`说明：${approval.reason}`);
+  const context = approval.networkApprovalContext;
+  if (context?.host) {
+    const scheme = context.protocol ? `${context.protocol}://` : "";
+    const port = context.port ? `:${context.port}` : "";
+    details.push(`网络：${scheme}${context.host}${port}`);
+  }
+  if (approval.permissionSummary) details.push(`权限：${approval.permissionSummary}`);
+  if (approval.command) details.push(`命令：${approval.command}`);
+  const targetPath = approval.grantRoot || approval.cwd;
+  if (targetPath) details.push(`路径：${targetPath}`);
+  return details.length > 0 ? `${title}\n${details.join("\n")}` : title;
+}
+
+async function recordApprovalResolution(approval, decision) {
+  if (!approval?.threadId || !approval?.turnId || !decision) return;
+  const history = await loadApprovalHistory();
+  const id = `approval-${approval.id}-${decision}`;
+  const record = {
+    id,
+    threadId: approval.threadId,
+    turnId: approval.turnId,
+    item: {
+      type: "commandExecution",
+      id,
+      command: approvalResolutionText(approval, decision),
+      activity: "approval",
+      status: decision === "decline" ? "declined" : "completed",
+      exitCode: null,
+      duration: null,
+      createdAt: Date.now() / 1000,
+    },
+  };
+  const existingIndex = history.findIndex((value) => value.id === id);
+  if (existingIndex >= 0) history[existingIndex] = record;
+  else history.push(record);
+  if (history.length > 2000) history.splice(0, history.length - 2000);
+  approvalHistoryWrite = approvalHistoryWrite.then(async () => {
+    await fs.mkdir(path.dirname(APPROVAL_HISTORY_FILE), { recursive: true });
+    await fs.writeFile(APPROVAL_HISTORY_FILE, JSON.stringify(history), "utf8");
+  });
+  await approvalHistoryWrite;
+}
+
+async function mergeApprovalHistory(threadId, turns) {
+  const history = await loadApprovalHistory();
+  const byTurn = new Map();
+  for (const record of history) {
+    if (record.threadId !== threadId || !record.turnId || !record.item) continue;
+    if (!byTurn.has(record.turnId)) byTurn.set(record.turnId, []);
+    byTurn.get(record.turnId).push(record.item);
+  }
+  return turns.map((turn) => {
+    const approvalItems = byTurn.get(turn.id) || [];
+    if (approvalItems.length === 0) return turn;
+    const items = [...(turn.items || [])];
+    const existingIDs = new Set(items.map((item) => item.id).filter(Boolean));
+    items.push(...approvalItems.filter((item) => !existingIDs.has(item.id)));
+    const orderedItems = items.map((item, index) => ({ item, index })).sort((left, right) => {
+      const leftTime = left.item.createdAt ?? Number.MAX_SAFE_INTEGER;
+      const rightTime = right.item.createdAt ?? Number.MAX_SAFE_INTEGER;
+      return leftTime === rightTime ? left.index - right.index : leftTime - rightTime;
+    }).map(({ item }) => item);
+    return { ...turn, items: orderedItems };
+  });
+}
 
 function normalizeModel(model) {
   const id = model?.id || model?.model || model?.slug;
@@ -86,16 +180,77 @@ async function readCachedModels() {
   }
 }
 
+async function readCliModelDefaults() {
+  try {
+    const source = await fs.readFile(config.codexConfigPath, "utf8");
+    let section = "";
+    let model = null;
+    let effort = null;
+    for (const rawLine of source.split("\n")) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const sectionMatch = line.match(/^\[([^\]]+)\]$/);
+      if (sectionMatch) {
+        section = sectionMatch[1];
+        continue;
+      }
+      if (section) continue;
+      const valueMatch = line.match(/^([A-Za-z0-9_]+)\s*=\s*["']([^"']+)["']/);
+      if (!valueMatch) continue;
+      if (valueMatch[1] === "model") model = valueMatch[2].trim();
+      if (valueMatch[1] === "model_reasoning_effort") effort = valueMatch[2].trim();
+    }
+    return { model, effort };
+  } catch {
+    return { model: null, effort: null };
+  }
+}
+
+async function applyCliModelDefaults(response) {
+  const configured = await readCliModelDefaults();
+  if (!configured.model) return response;
+  const data = [...(response?.data || [])];
+  const index = data.findIndex((model) => (model.id || model.model) === configured.model);
+  if (index >= 0) {
+    data[index] = {
+      ...data[index],
+      isDefault: true,
+      defaultReasoningEffort: configured.effort || data[index].defaultReasoningEffort || null,
+    };
+  } else {
+    data.unshift(normalizeModel({
+      id: configured.model,
+      model: configured.model,
+      displayName: configured.model,
+      isDefault: true,
+      defaultReasoningEffort: configured.effort,
+      supportedReasoningEfforts: configured.effort ? [configured.effort] : [],
+    }));
+  }
+  return {
+    ...response,
+    data: data.map((model) => ({
+      ...model,
+      isDefault: (model.id || model.model) === configured.model,
+    })),
+    configuredModel: configured.model,
+    configuredReasoningEffort: configured.effort,
+    source: "codex-cli",
+  };
+}
+
 async function listModels() {
   if (!client.socket || client.socket.closed) {
     const cached = await readCachedModels();
-    if (cached) return cached;
+    if (cached) return applyCliModelDefaults(cached);
   }
   try {
-    return normalizeModelsResponse(await client.request("model/list", { limit: 100 }));
+    return applyCliModelDefaults(normalizeModelsResponse(
+      await client.request("model/list", { limit: 100 }),
+    ));
   } catch (error) {
     const cached = await readCachedModels();
-    if (cached) return cached;
+    if (cached) return applyCliModelDefaults(cached);
     throw error;
   }
 }
@@ -109,6 +264,51 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
+function fileContentType(filePath) {
+  const extension = path.extname(filePath).toLowerCase();
+  return ({
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".ts": "text/plain; charset=utf-8",
+    ".swift": "text/plain; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".xml": "application/xml; charset=utf-8",
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+  })[extension] || "application/octet-stream";
+}
+
+async function sendFilePreview(res, candidate) {
+  const filePath = await normalizeWorkspacePath(candidate);
+  const metadata = await fs.stat(filePath);
+  if (!metadata.isFile()) {
+    const error = new Error("Path is not a file");
+    error.status = 422;
+    throw error;
+  }
+  if (metadata.size > 50 * 1024 * 1024) {
+    const error = new Error("File is too large to preview (maximum 50 MB)");
+    error.status = 413;
+    throw error;
+  }
+  const data = await fs.readFile(filePath);
+  res.writeHead(200, {
+    "content-type": fileContentType(filePath),
+    "content-length": data.length,
+    "cache-control": "no-store",
+    "access-control-allow-origin": "*",
+  });
+  res.end(data);
+}
+
 function errorResponse(res, error) {
   const status = error.status || (error instanceof CodexError ? 502 : 400);
   json(res, status, { error: error.message || "Request failed" });
@@ -119,14 +319,10 @@ function isImage(filePath) {
 }
 
 function normalizePath(candidate) {
-  const resolved = path.resolve(candidate || config.defaultCwd);
-  const allowed = config.fileRoots.some((root) => resolved === root || resolved.startsWith(`${root}${path.sep}`));
-  if (!allowed) {
-    const error = new Error("Path is outside FILE_ROOTS");
-    error.status = 403;
-    throw error;
-  }
-  return resolved;
+  return normalizeAllowedPath(candidate, {
+    defaultPath: config.defaultCwd,
+    roots: config.fileRoots,
+  });
 }
 
 function authOk(req, url) {
@@ -252,8 +448,22 @@ client.on("notification", (message) => {
   const requestId = message.params?.requestId;
   if (requestId === undefined) return;
   const id = String(requestId);
-  if (!pendingApprovals.delete(id)) return;
-  broadcastGlobal("approval/resolved", { id, threadId: message.params?.threadId || null });
+  const pendingApproval = pendingApprovals.get(id);
+  if (!pendingApproval) return;
+  pendingApprovals.delete(id);
+  const decision = message.params?.decision
+    || message.params?.response?.decision
+    || message.params?.result?.decision
+    || null;
+  void recordApprovalResolution(pendingApproval.approval, decision).catch((error) => {
+    console.error("Failed to persist approval history:", error.message);
+  });
+  broadcastGlobal("approval/resolved", {
+    id,
+    threadId: message.params?.threadId || pendingApproval.approval.threadId || null,
+    decision,
+    approval: pendingApproval.approval,
+  });
 });
 
 function subscribe(threadId, res) {
@@ -284,10 +494,10 @@ function replayEvents(threadId, res) {
   }
 }
 
-async function fileListing(url) {
-  const dir = normalizePath(url.searchParams.get("path"));
+async function fileListing(candidate) {
+  const dir = await normalizeWorkspacePath(candidate);
   const entries = await fs.readdir(dir, { withFileTypes: true });
-  return Promise.all(entries
+  const data = await Promise.all(entries
     .filter((entry) => !entry.name.startsWith("."))
     .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
     .map(async (entry) => {
@@ -302,6 +512,7 @@ async function fileListing(url) {
         selectable: true,
       };
     }));
+  return { path: dir, entries: data };
 }
 
 async function listAllThreads(archived = false) {
@@ -328,7 +539,7 @@ async function readThreadDetail(threadId, { limit = Number.MAX_SAFE_INTEGER, bef
         const thread = result.thread || result;
         return { thread, turns: thread.turns || [] };
       });
-  const turns = fullDetail.turns || [];
+  const turns = await mergeApprovalHistory(threadId, fullDetail.turns || []);
   const aroundIndex = around ? turns.findIndex((turn) => turn.id === around) : -1;
   const beforeIndex = before ? turns.findIndex((turn) => turn.id === before) : turns.length;
   let end = beforeIndex >= 0 ? beforeIndex : turns.length;
@@ -353,8 +564,16 @@ function itemText(item) {
 }
 
 function messageIndexFromDetail(detail) {
+  const data = searchableConversationMessages(detail.turns).map((item) => ({
+    ...item,
+    text: item.text.slice(0, 240),
+  }));
+  return { data };
+}
+
+function searchableConversationMessages(turns = []) {
   const data = [];
-  for (const turn of detail.turns || []) {
+  for (const turn of turns) {
     const items = turn.items || [];
     const finalAgentIndex = items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer") >= 0
       ? items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer")
@@ -367,16 +586,67 @@ function messageIndexFromDetail(detail) {
         id: item.id || `${turn.id}-${item.type}-${index}`,
         turnId: turn.id,
         role: item.type === "userMessage" ? "user" : "assistant",
-        text: text.replace(/\s+/g, " ").slice(0, 240),
+        text: text.replace(/\s+/g, " "),
         createdAt: item.createdAt || turn.startedAt || null,
       });
     });
   }
-  return { data };
+  return data;
+}
+
+function searchSnippet(text, query) {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  const index = normalized.toLocaleLowerCase().indexOf(query.toLocaleLowerCase());
+  if (index < 0) return null;
+  const start = Math.max(0, index - 70);
+  const end = Math.min(normalized.length, index + query.length + 110);
+  return `${start > 0 ? "…" : ""}${normalized.slice(start, end)}${end < normalized.length ? "…" : ""}`;
+}
+
+async function searchConversationMessages(query) {
+  const trimmed = String(query || "").trim();
+  if (!trimmed) return [];
+  const threads = await listAllThreads(false);
+  const settled = await Promise.allSettled(threads.map(async (thread) => {
+    const turns = Array.isArray(thread.turns)
+      ? thread.turns
+      : (await readThreadDetail(thread.id)).turns;
+    return searchableConversationMessages(turns).flatMap((item) => {
+      const snippet = searchSnippet(item.text, trimmed);
+      if (!snippet) return [];
+      return [{
+        id: `${thread.id}:${item.id}`,
+        threadId: thread.id,
+        messageId: item.id,
+        turnId: item.turnId,
+        role: item.role,
+        text: item.text.slice(0, 240),
+        snippet,
+        createdAt: item.createdAt,
+      }];
+    });
+  }));
+  return settled
+    .filter((result) => result.status === "fulfilled")
+    .flatMap((result) => result.value)
+    .slice(0, 500);
 }
 
 function compactTurn(turn) {
   const items = turn.items || [];
+  // An active turn has no stable "final" item yet. Compacting it to the last
+  // assistant message makes a relaunched client lose all earlier commentary
+  // and tool executions from the same task. Keep the active turn complete;
+  // completed turns still use the lightweight representation below.
+  if (turn.status === "inProgress") {
+    return {
+      ...turn,
+      items,
+      itemsView: "full",
+      processItemCount: 0,
+      detailsLoaded: true,
+    };
+  }
   const finalAgentIndex = items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer") >= 0
     ? items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer")
     : items.findLastIndex((item) => item.type === "agentMessage");
@@ -441,6 +711,39 @@ function projectsFromThreads(threads) {
     project.updatedAt = Math.max(project.updatedAt, thread.updatedAt || thread.createdAt || 0);
   }
   return [...projects.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+function projectRootsFromThreads(threads) {
+  return projectsFromThreads(threads)
+    .map((project) => project.cwd)
+    .filter((cwd) => cwd && cwd !== NO_PROJECT_CWD)
+    .map((cwd) => path.resolve(cwd));
+}
+
+async function normalizeWorkspacePath(candidate) {
+  try {
+    return normalizePath(candidate);
+  } catch (error) {
+    if (error.status !== 403) throw error;
+  }
+
+  const cachedRoots = (latestProjectSnapshot?.projects || [])
+    .map((project) => project.cwd)
+    .filter((cwd) => cwd && cwd !== NO_PROJECT_CWD)
+    .map((cwd) => path.resolve(cwd));
+  try {
+    return normalizeAllowedPath(candidate, {
+      defaultPath: config.defaultCwd,
+      roots: cachedRoots,
+    });
+  } catch (error) {
+    if (error.status !== 403) throw error;
+  }
+
+  return normalizeAllowedPath(candidate, {
+    defaultPath: config.defaultCwd,
+    roots: projectRootsFromThreads(await listAllThreads(false)),
+  });
 }
 
 function threadSignature(threads) {
@@ -522,7 +825,7 @@ async function normalizeThreadCwd(candidate) {
   }
 }
 
-function inputFrom(bodyData) {
+async function inputFrom(bodyData) {
   const message = String(bodyData.message || "").trim();
   if (!message) {
     const error = new Error("message is required");
@@ -531,7 +834,7 @@ function inputFrom(bodyData) {
   }
   const input = [{ type: "text", text: message }];
   for (const file of bodyData.files || []) {
-    const filePath = normalizePath(file.path || file);
+    const filePath = await normalizeWorkspacePath(file.path || file);
     if (isImage(filePath)) input.push({ type: "localImage", path: filePath });
     else input[0].text += `\n\n[Attached local file: ${filePath}]`;
   }
@@ -595,6 +898,10 @@ async function handle(req, res, url) {
     const threads = await listAllThreads(false);
     return json(res, 200, { data: projectsFromThreads(threads), total: threads.length });
   }
+  if (req.method === "GET" && url.pathname === "/api/search/messages") {
+    const query = url.searchParams.get("q") || "";
+    return json(res, 200, { data: await searchConversationMessages(query) });
+  }
   if (req.method === "GET" && url.pathname === "/api/threads") {
     const archived = url.searchParams.has("archived") ? url.searchParams.get("archived") === "true" : false;
     const data = await listAllThreads(archived);
@@ -617,7 +924,10 @@ async function handle(req, res, url) {
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/files") {
-    return json(res, 200, { path: normalizePath(url.searchParams.get("path")), entries: await fileListing(url) });
+    return json(res, 200, await fileListing(url.searchParams.get("path")));
+  }
+  if (req.method === "GET" && url.pathname === "/api/file") {
+    return sendFilePreview(res, url.searchParams.get("path"));
   }
   if (req.method === "GET" && url.pathname === "/api/approvals") {
     return json(res, 200, { data: [...pendingApprovals.values()].map(({ approval }) => approval) });
@@ -647,7 +957,13 @@ async function handle(req, res, url) {
       client.respondServerRequest(pendingApproval.rpcId, { decision });
     }
     pendingApprovals.delete(id);
-    broadcastGlobal("approval/resolved", { id, threadId: pendingApproval.approval.threadId, decision });
+    await recordApprovalResolution(pendingApproval.approval, decision);
+    broadcastGlobal("approval/resolved", {
+      id,
+      threadId: pendingApproval.approval.threadId,
+      decision,
+      approval: pendingApproval.approval,
+    });
     scheduleThreadSync("approval-resolved", 100);
     return json(res, 200, { ok: true, id, decision });
   }
@@ -728,7 +1044,7 @@ async function handle(req, res, url) {
     if (data.prompt) {
       const turnResult = await client.request("turn/start", {
         threadId: thread.id,
-        input: inputFrom({ message: data.prompt, files: data.files }),
+        input: await inputFrom({ message: data.prompt, files: data.files }),
         model: data.model || null,
         effort: data.effort || null,
       });
@@ -738,7 +1054,7 @@ async function handle(req, res, url) {
     return json(res, 201, { thread, turn });
   }
 
-  const threadMatch = url.pathname.match(/^\/api\/threads\/([^/]+)(?:\/(message|stop|archive))?$/);
+  const threadMatch = url.pathname.match(/^\/api\/threads\/([^/]+)(?:\/(message|stop|archive|fork))?$/);
   if (threadMatch) {
     const threadId = decodeURIComponent(threadMatch[1]);
     const action = threadMatch[2];
@@ -747,12 +1063,41 @@ async function handle(req, res, url) {
       const resume = await client.subscribeThread(threadId);
       const turnResult = await client.request("turn/start", {
         threadId,
-        input: inputFrom(data),
+        input: await inputFrom(data),
         model: data.model || null,
         effort: data.effort || null,
       });
       scheduleThreadSync("message-sent", 100);
       return json(res, 202, { thread: resume?.thread || resume || null, turn: turnResult.turn || turnResult });
+    }
+    if (req.method === "POST" && action === "fork") {
+      const data = await body(req);
+      const turnId = String(data.turnId || "").trim();
+      if (!turnId) {
+        const error = new Error("turnId is required");
+        error.status = 422;
+        throw error;
+      }
+      const forkParams = { threadId };
+      if (data.position === "before") forkParams.beforeTurnId = turnId;
+      else forkParams.lastTurnId = turnId;
+      const forkResult = await client.request("thread/fork", forkParams);
+      const forkedThread = forkResult.thread || forkResult;
+      client.markThreadSubscribed(forkedThread.id);
+
+      let turn = null;
+      const editedMessage = String(data.message || "").trim();
+      if (editedMessage) {
+        const turnResult = await client.request("turn/start", {
+          threadId: forkedThread.id,
+          input: await inputFrom({ message: editedMessage, files: data.files }),
+          model: data.model || null,
+          effort: data.effort || null,
+        });
+        turn = turnResult.turn || turnResult;
+      }
+      scheduleThreadSync("thread-forked", 100);
+      return json(res, 201, { thread: forkedThread, turn });
     }
     if (req.method === "POST" && action === "stop") {
       const { turnId, source, thread } = await resolveActiveTurn(threadId);
@@ -790,6 +1135,9 @@ async function main() {
   if (!config.isLoopback && !config.authToken) {
     throw new Error("HOST is not loopback; set AUTH_TOKEN before exposing the controller");
   }
+  // Show pairing information immediately. Starting the Codex control client
+  // can take a moment, but the phone can already capture the connection data.
+  printConnectionQRCode({ host: config.host, port: config.port, authToken: config.authToken });
   try {
     await client.start();
   } catch (error) {

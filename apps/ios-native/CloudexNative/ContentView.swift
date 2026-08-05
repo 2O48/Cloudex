@@ -2,31 +2,76 @@ import SwiftUI
 import gitdiff
 import UIKit
 
+private enum ConversationSubpage: Hashable {
+    case conversation
+    case files
+    case browser
+}
+
 struct ContentView: View {
     @EnvironmentObject private var viewModel: AppViewModel
+    @StateObject private var chatScrollController = ChatScrollController()
     let expectedThreadID: String?
-    @State private var showingSettings = false
+    let onToggleDirectory: (() -> Void)?
+    let showsDirectoryButton: Bool
     @State private var showingFilePicker = false
-    @State private var didInitialScroll = false
     @State private var isAtChatBottom = true
+    @State private var isFollowingChatBottom = true
+    @State private var hasLoadedChatContent = false
     @State private var scrollToBottomRequest = 0
+    @State private var explicitScrollGeneration = 0
+    @State private var isExplicitScrollInProgress = false
+    @State private var initialBottomScrollGeneration = 0
+    @State private var isInitialBottomScrollInProgress = false
+    @State private var isPreparingInitialLayout = true
+    @State private var isStaticConversationLocked = false
+    @State private var messagePositioningGeneration = 0
+    @State private var isMessagePositioningInProgress = false
+    @State private var isProcessLayoutChangeInProgress = false
+    @State private var processLayoutGeneration = 0
+    @State private var isUserScrollingChat = false
     @State private var messageJumpSnapshot: [MessageJumpItem] = []
     @State private var scrollTargetMessageID: String?
-    @State private var stableMessages: [ChatMessage] = []
+    @State private var messageTextHighlight: MessageTextHighlight?
+    @State private var chatContentSnapshot = ChatScrollContent.empty
     @State private var collapseProcessRequest = 0
     @State private var floatingCollapseVisible = false
     @State private var showingTokenUsage = false
+    @State private var showingMessageDirectory = false
+    @State private var taskTimerTurnID: String?
+    @State private var taskTimerStartedAt: Double?
+    @State private var taskTimerCompletedAt: Double?
+    @State private var taskTimerHidden = true
     @FocusState private var composerFocused: Bool
     @State private var keyboardHeight: CGFloat = 0
 
-    init(expectedThreadID: String? = nil) {
+    init(
+        expectedThreadID: String? = nil,
+        onToggleDirectory: (() -> Void)? = nil,
+        showsDirectoryButton: Bool = true
+    ) {
         self.expectedThreadID = expectedThreadID
+        self.onToggleDirectory = onToggleDirectory
+        self.showsDirectoryButton = showsDirectoryButton
     }
 
     var body: some View {
         ZStack {
             liquidBackground
             chat
+                // Keep the full message tree in the hierarchy so SwiftUI
+                // can measure it, but reveal text only after the initial
+                // bottom position has been calculated.
+                .opacity(isPreparingInitialLayout ? 0 : 1)
+            if isPreparingInitialLayout {
+                ProgressView()
+                    .controlSize(.small)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(.regularMaterial.opacity(0.72))
+                .allowsHitTesting(false)
+                .transition(.opacity)
+                .zIndex(20)
+            }
             if floatingCollapseVisible {
                 VStack {
                     HStack {
@@ -45,7 +90,7 @@ struct ContentView: View {
                         Spacer(minLength: 0)
                     }
                     .padding(.leading, 14)
-                    .padding(.top, 68)
+                    .padding(.top, 14)
                     Spacer(minLength: 0)
                 }
                 .transition(.scale.combined(with: .opacity))
@@ -53,49 +98,65 @@ struct ContentView: View {
             }
             VStack(spacing: 0) {
                 Spacer(minLength: 0)
-                if !isAtChatBottom {
-                    Button {
-                        scrollToBottomRequest += 1
-                    } label: {
-                        Image(systemName: "arrow.down")
-                            .font(.body.weight(.semibold))
-                            .frame(width: 42, height: 42)
-                            .contentShape(Circle())
+                // Content growth briefly makes the geometry report that the
+                // viewport is not at the bottom before follow-mode scrolling
+                // catches up. Do not flash the button during that interval.
+                // It becomes available only after a user gesture explicitly
+                // leaves follow mode.
+                if !isFollowingChatBottom {
+                    HStack {
+                        Spacer(minLength: 0)
+                        Button {
+                            showLatestChatContent()
+                        } label: {
+                            Image(systemName: "arrow.down")
+                                .font(.body.weight(.semibold))
+                                .frame(width: 42, height: 42)
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .liquidGlass(in: Circle(), interactive: true)
+                        .shadow(color: .black.opacity(0.1), radius: 10, y: 4)
+                        .accessibilityLabel("滚动到最新消息")
+                        .transition(.scale.combined(with: .opacity))
+                        Spacer(minLength: 0)
                     }
-                    .buttonStyle(.plain)
-                    .liquidGlass(in: Circle(), interactive: true)
-                    .shadow(color: .black.opacity(0.1), radius: 10, y: 4)
                     .padding(.bottom, 6)
-                    .transition(.scale.combined(with: .opacity))
-                    .accessibilityLabel("滚动到最新消息")
                 }
                 composer
             }
-            .animation(.easeInOut(duration: 0.18), value: isAtChatBottom)
+            .animation(.easeInOut(duration: 0.18), value: isFollowingChatBottom)
         }
         .ignoresSafeArea(.keyboard, edges: .top)
+        .navigationTitle(viewModel.navigationTitle)
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .principal) {
-                ChatNavigationTitle(
-                    title: viewModel.navigationTitle,
-                    projectTitle: viewModel.projectTitle,
-                    isConnected: viewModel.isConnected,
-                    messages: messageJumpSnapshot,
-                    onSelect: { scrollTargetMessageID = $0.id }
-                )
-                .equatable()
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button { showingSettings = true } label: {
-                    Image(systemName: "gearshape")
+            if showsDirectoryButton {
+                if let onToggleDirectory {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button(action: onToggleDirectory) {
+                            Image(systemName: "list.bullet")
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("打开对话目录")
+                    }
+                } else {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            showingMessageDirectory = true
+                        } label: {
+                            Image(systemName: "list.bullet")
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("打开对话目录")
+                    }
                 }
-                .accessibilityLabel("打开设置")
             }
         }
-        .sheet(isPresented: $showingSettings) {
-            SettingsView(isPresented: $showingSettings)
-                .environmentObject(viewModel)
-        }
+        .toolbarBackground(.hidden, for: .navigationBar)
+        .toolbar(.visible, for: .navigationBar)
         .sheet(isPresented: $showingFilePicker) {
             RemoteFilePickerView(
                 isPresented: $showingFilePicker,
@@ -109,18 +170,89 @@ struct ContentView: View {
             TokenUsageSheet(usage: viewModel.selectedThread?.usage)
                 .presentationDetents([.medium])
         }
+        .sheet(isPresented: $showingMessageDirectory) {
+            NavigationStack {
+                MessageJumpListView(
+                    messages: messageJumpSnapshot,
+                    onSelect: { showMessage($0.id) }
+                )
+                .environmentObject(viewModel)
+            }
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+        }
         .onChange(of: viewModel.messageIndex, initial: true) { _, items in
-            messageJumpSnapshot = items.map(MessageJumpItem.init)
+            // A native Menu loses its internal scroll position whenever its
+            // children are rebuilt. Keep its data stable while a task streams
+            // new messages, then refresh once after the task finishes.
+            guard !viewModel.active || messageJumpSnapshot.isEmpty else { return }
+            let snapshot = MessageJumpItem.paired(from: items, turns: viewModel.detail?.turns ?? [])
+            if messageJumpSnapshot != snapshot {
+                messageJumpSnapshot = snapshot
+            }
+        }
+        .onChange(of: viewModel.active) { _, active in
+            if active {
+                isStaticConversationLocked = false
+                updateChatContent(force: true)
+            } else if hasLoadedChatContent && !isPreparingInitialLayout {
+                // Apply the terminal snapshot once, then freeze completed
+                // conversations against background layout changes.
+                updateChatContent(force: true)
+                DispatchQueue.main.async {
+                    guard !viewModel.active, !isPreparingInitialLayout else { return }
+                    isStaticConversationLocked = true
+                }
+            }
+            guard !active else { return }
+            let snapshot = MessageJumpItem.paired(
+                from: viewModel.messageIndex,
+                turns: viewModel.detail?.turns ?? []
+            )
+            if messageJumpSnapshot != snapshot {
+                messageJumpSnapshot = snapshot
+            }
         }
         .onChange(of: viewModel.isOpeningThread, initial: true) { _, opening in
-            guard !opening else { return }
-            stableMessages = viewModel.renderedMessages
+            if opening {
+                resetChatLayoutForNewThread()
+                return
+            }
+            updateChatContent(force: !hasLoadedChatContent)
+            // During an active task the target message can arrive while the
+            // conversation is still opening. The ScrollView is disabled in
+            // that phase, so keep the request alive and fulfill it only after
+            // opening has completed.
+            fulfillPendingMessageJumpIfPossible()
         }
-        .onChange(of: viewModel.detail) { _, _ in
-            // Keep history immutable while a task is streaming. The final
-            // completed snapshot replaces it once, after the task ends.
-            guard !viewModel.liveRunning else { return }
-            stableMessages = viewModel.renderedMessages
+        .onChange(of: viewModel.detail, initial: true) { _, _ in
+            syncTaskTimerState()
+        }
+        .onChange(of: viewModel.liveRunning, initial: true) { _, _ in
+            syncTaskTimerState()
+        }
+        .onChange(of: viewModel.selectedThreadID) { _, _ in
+            taskTimerTurnID = nil
+            taskTimerStartedAt = nil
+            taskTimerCompletedAt = nil
+            taskTimerHidden = true
+            syncTaskTimerState()
+        }
+        .onChange(of: currentChatContent, initial: true) { _, _ in
+            updateChatContent()
+            fulfillPendingMessageJumpIfPossible()
+        }
+        .onChange(of: viewModel.pendingMessageJump, initial: true) { _, _ in
+            fulfillPendingMessageJumpIfPossible()
+        }
+        .onChange(of: isFollowingChatBottom) { _, following in
+            guard following,
+                  !isPreparingInitialLayout,
+                  !viewModel.isOpeningThread else { return }
+            updateChatContent(force: true)
+        }
+        .onChange(of: expectedThreadID, initial: true) { _, _ in
+            resetChatLayoutForNewThread()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
             guard let value = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue else { return }
@@ -154,15 +286,16 @@ struct ContentView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 let isNewChat = expectedThreadID?.hasPrefix("new-") == true
-                let isReady = isNewChat || expectedThreadID == viewModel.selectedThreadID
-                let messages = isReady ? displayedMessages : []
+                let isReady = isNewChat
+                    || (expectedThreadID == viewModel.selectedThreadID && !viewModel.isOpeningThread)
+                let content = isReady ? chatContentSnapshot : .empty
                 LazyVStack(spacing: 12) {
                     if !isReady {
                         ProgressView("正在打开对话…")
                             .frame(maxWidth: .infinity)
                             .padding(.top, 120)
                     }
-                    if isReady && viewModel.selectedThread == nil && messages.isEmpty {
+                    if isReady && viewModel.selectedThread == nil && content.messages.isEmpty {
                         VStack(spacing: 10) {
                             Spacer(minLength: 130)
                             Text(viewModel.isCreatingNew ? "开始新对话" : "选择一个对话")
@@ -178,7 +311,7 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity)
                     }
 
-                    if let thread = viewModel.selectedThread {
+                    if isReady, let thread = viewModel.selectedThread {
                         VStack(spacing: 4) {
                             Text("\(threadStatus(thread)) · \(DateFormatting.string(from: thread.updatedAt))")
                             Text(thread.cwd ?? "")
@@ -190,10 +323,23 @@ struct ContentView: View {
                         .padding(.bottom, 4)
                     }
 
-                    ForEach(messages) { message in
+                    ForEach(content.messages) { message in
                         MessageBubble(
                             message: message,
+                            highlightQuery: messageTextHighlight?.messageID == message.id
+                                ? messageTextHighlight?.query
+                                : nil,
                             collapseRequest: $collapseProcessRequest,
+                            onQuickFill: { text in
+                                viewModel.draft = text
+                                composerFocused = true
+                            },
+                            onFork: {
+                                await viewModel.forkAssistantMessage(message)
+                            },
+                            onProcessInteraction: {
+                                beginProcessLayoutChange()
+                            },
                             onFloatingStateChange: { visible in
                                 floatingCollapseVisible = visible
                             }
@@ -201,50 +347,137 @@ struct ContentView: View {
                         .id(message.id)
                     }
 
-                    ForEach(viewModel.visibleApprovals) { approval in
+                    ForEach(content.approvals) { approval in
                         ApprovalBubble(approval: approval)
                             .environmentObject(viewModel)
                             .id("approval-\(approval.id)")
                             .transition(.opacity.combined(with: .move(edge: .bottom)))
                     }
 
-                    if viewModel.active {
+                    if content.active {
                         ProgressView()
                             .padding(.vertical, 8)
                     }
 
-                    // The scroll target must be at the true end of the scroll
-                    // content, after the space reserved for the overlaid
-                    // composer. Otherwise scrolling to it moves the content
-                    // downward and reveals older messages.
+                    // Reserve only the space needed by the overlaid composer.
+                    // Keeping this close to the actual composer height avoids
+                    // leaving a visible gap below the running-task spinner.
                     Color.clear
-                        .frame(height: viewModel.attachedFiles.isEmpty ? 144 : 188)
+                        .frame(height: viewModel.attachedFiles.isEmpty ? 112 : 156)
                         .id("chat-bottom")
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 16)
-            }
-            .scrollDisabled(viewModel.isOpeningThread)
-            .scrollDismissesKeyboard(.interactively)
-            .trackChatBottom($isAtChatBottom)
-            // This is the sole automatic positioning: open a conversation at
-            // its latest loaded message once. Subsequent updates are left to
-            // the native scroll view and the user's own gestures.
-            .onChange(of: initialScrollContentID, initial: true) { _, lastMessageID in
-                guard lastMessageID != nil, !didInitialScroll else { return }
-                didInitialScroll = true
-                DispatchQueue.main.async {
-                    proxy.scrollTo("chat-bottom", anchor: .bottom)
+                .background {
+                    ChatScrollViewResolver(controller: chatScrollController)
+                        .frame(width: 0, height: 0)
                 }
             }
+            .nativeTopScrollEdgeEffect()
+            .scrollDisabled(viewModel.isOpeningThread || isPreparingInitialLayout)
+            .scrollDismissesKeyboard(.interactively)
+            .trackChatScroll(
+                isAtBottom: $isAtChatBottom,
+                isFollowingBottom: $isFollowingChatBottom,
+                isExplicitScrollInProgress: $isExplicitScrollInProgress,
+                isUserScrolling: $isUserScrollingChat,
+                isLayoutChangeInProgress: $isProcessLayoutChangeInProgress,
+                isFollowRestorationDisabled: {
+                    isPreparingInitialLayout || viewModel.isOpeningThread
+                },
+                nativeIsAtBottom: { chatScrollController.isAtBottom() }
+            )
             .onChange(of: scrollToBottomRequest) { _, _ in
-                proxy.scrollTo("chat-bottom", anchor: .bottom)
+                guard !isMessagePositioningInProgress,
+                      isFollowingChatBottom || isExplicitScrollInProgress else { return }
+                let generation = explicitScrollGeneration
+                let initialGeneration = initialBottomScrollGeneration
+                let requestGeneration = scrollToBottomRequest
+                DispatchQueue.main.async {
+                    guard !isMessagePositioningInProgress,
+                          scrollToBottomRequest == requestGeneration,
+                          isFollowingChatBottom
+                            || (isExplicitScrollInProgress && explicitScrollGeneration == generation) else { return }
+
+                    let initialStillOwnsScroll = isInitialBottomScrollInProgress
+                        && initialBottomScrollGeneration == initialGeneration
+                        && isFollowingChatBottom
+                        && !isUserScrollingChat
+                    if initialStillOwnsScroll {
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            proxy.scrollTo("chat-bottom", anchor: .bottom)
+                        }
+
+                        // One anchor repeat lets LazyVStack materialize the
+                        // target row. A single native reconciliation then
+                        // accounts for adjusted insets without repeatedly
+                        // chasing a growing contentSize.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                            guard isInitialBottomScrollInProgress,
+                                  initialBottomScrollGeneration == initialGeneration,
+                                  scrollToBottomRequest == requestGeneration,
+                                  isFollowingChatBottom,
+                                  !isUserScrollingChat else { return }
+                            var repeatTransaction = Transaction()
+                            repeatTransaction.disablesAnimations = true
+                            withTransaction(repeatTransaction) {
+                                proxy.scrollTo("chat-bottom", anchor: .bottom)
+                            }
+                        }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            guard isInitialBottomScrollInProgress,
+                                  initialBottomScrollGeneration == initialGeneration,
+                                  scrollToBottomRequest == requestGeneration else { return }
+                            if isFollowingChatBottom && !isUserScrollingChat {
+                                _ = chatScrollController.scrollToBottom(animated: false)
+                            }
+                            isInitialBottomScrollInProgress = false
+                            isAtChatBottom = chatScrollController.isAtBottom()
+                        }
+                        return
+                    }
+
+                    let explicitStillOwnsScroll = isExplicitScrollInProgress
+                        && explicitScrollGeneration == generation
+                    if !chatScrollController.scrollToBottom(animated: true) {
+                        withAnimation(.easeOut(duration: 0.28)) {
+                            proxy.scrollTo("chat-bottom", anchor: .bottom)
+                        }
+                    }
+                    if explicitStillOwnsScroll {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                            guard isExplicitScrollInProgress,
+                                  explicitScrollGeneration == generation,
+                                  scrollToBottomRequest == requestGeneration else { return }
+                            _ = chatScrollController.scrollToBottom(animated: true)
+                        }
+                    }
+                }
             }
             .onChange(of: scrollTargetMessageID) { _, messageID in
                 guard let messageID else { return }
-                proxy.scrollTo(messageID, anchor: .top)
-                DispatchQueue.main.async {
+                let generation = messagePositioningGeneration
+                let positionTarget = {
+                    guard isMessagePositioningInProgress,
+                          messagePositioningGeneration == generation else { return }
+                    proxy.scrollTo(messageID, anchor: .top)
+                }
+                // LazyVStack layout and live message insertion can move the
+                // target during the first few frames. Reassert the explicit
+                // destination until layout has settled instead of allowing a
+                // pending bottom-follow scroll to win the race.
+                DispatchQueue.main.async(execute: positionTarget)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: positionTarget)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+                    positionTarget()
+                    guard messagePositioningGeneration == generation else { return }
                     scrollTargetMessageID = nil
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.48) {
+                    guard messagePositioningGeneration == generation else { return }
+                    isMessagePositioningInProgress = false
                 }
             }
         }
@@ -283,15 +516,12 @@ struct ContentView: View {
                             Label("读取模型列表", systemImage: "arrow.clockwise")
                         }
                     } else {
-                        ForEach(viewModel.models, id: \.identifier) { model in
-                            Button {
-                                viewModel.selectModel(model.identifier)
-                            } label: {
-                                if model.identifier == viewModel.selectedModelID {
-                                    Label(model.title, systemImage: "checkmark")
-                                } else {
-                                    Text(model.title)
-                                }
+                        Picker("模型", selection: Binding(
+                            get: { viewModel.selectedModelID },
+                            set: { viewModel.selectModel($0) }
+                        )) {
+                            ForEach(viewModel.models, id: \.identifier) { model in
+                                Text(model.title).tag(model.identifier)
                             }
                         }
 
@@ -319,15 +549,12 @@ struct ContentView: View {
                     if viewModel.availableEfforts.isEmpty {
                         Text("默认")
                     } else {
-                        ForEach(viewModel.availableEfforts) { effort in
-                            Button {
-                                viewModel.selectEffort(effort.reasoningEffort)
-                            } label: {
-                                if effort.reasoningEffort == viewModel.selectedEffortID {
-                                    Label(effort.title, systemImage: "checkmark")
-                                } else {
-                                    Text(effort.title)
-                                }
+                        Picker("用量", selection: Binding(
+                            get: { viewModel.selectedEffortID },
+                            set: { viewModel.selectEffort($0) }
+                        )) {
+                            ForEach(viewModel.availableEfforts) { effort in
+                                Text(effort.title).tag(effort.reasoningEffort)
                             }
                         }
                     }
@@ -345,6 +572,8 @@ struct ContentView: View {
 
                 Spacer(minLength: 0)
 
+                taskTimerBubble
+
                 Button {
                     showingTokenUsage = true
                 } label: {
@@ -360,16 +589,35 @@ struct ContentView: View {
             }
             .padding(.horizontal, 20)
 
-            HStack(alignment: .bottom, spacing: 8) {
-                Button { showingFilePicker = true } label: {
-                    Image(systemName: "paperclip")
-                        .font(.body.weight(.semibold))
-                        .frame(width: 38, height: 38)
-                        .contentShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .disabled((viewModel.selectedProjectCWD ?? viewModel.selectedThread?.cwd ?? viewModel.projects.first?.cwd) == nil)
+            composerControls
+        }
+    }
 
+    @ViewBuilder
+    private var composerControls: some View {
+        if #available(iOS 26.0, *) {
+            GlassEffectContainer(spacing: 12) {
+                composerControlStack
+            }
+        } else {
+            composerControlStack
+        }
+    }
+
+    private var composerControlStack: some View {
+        HStack(alignment: .bottom, spacing: 10) {
+            Button { showingFilePicker = true } label: {
+                Image(systemName: "paperclip")
+                    .font(.body.weight(.semibold))
+                    .frame(width: 46, height: 46)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .liquidGlass(in: Circle(), interactive: true)
+            .disabled((viewModel.selectedProjectCWD ?? viewModel.selectedThread?.cwd ?? viewModel.projects.first?.cwd) == nil)
+            .accessibilityLabel("上传文件")
+
+            HStack(alignment: .bottom, spacing: 4) {
                 ZStack(alignment: .topLeading) {
                     if viewModel.draft.isEmpty {
                         Text(viewModel.selectedThreadID == nil ? "向 Codex 发送新指令…" : "继续发送指令…")
@@ -383,18 +631,19 @@ struct ContentView: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .focused($composerFocused)
                 }
-                .padding(.horizontal, 3)
+                .padding(.leading, 4)
 
                 if viewModel.active {
                     Button { Task { await viewModel.stop() } } label: {
                         Image(systemName: "stop.fill")
                             .font(.caption)
                             .foregroundStyle(.red)
-                            .frame(width: 38, height: 38)
+                            .frame(width: 40, height: 40)
                             .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
                     .disabled(viewModel.isBusy)
+                    .accessibilityLabel("停止任务")
                 } else {
                     Button { Task { await viewModel.send() } } label: {
                         Group {
@@ -406,35 +655,232 @@ struct ContentView: View {
                                     .foregroundStyle(.primary)
                             }
                         }
-                        .frame(width: 38, height: 38)
+                        .frame(width: 40, height: 40)
                         .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
                     .disabled(viewModel.isBusy || viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .accessibilityLabel("发送消息")
                 }
             }
-            .padding(8)
-            .liquidGlass(in: RoundedRectangle(cornerRadius: 28, style: .continuous))
-            .shadow(color: .black.opacity(0.12), radius: 18, y: 8)
-            .padding(.horizontal, 24)
-            .padding(.top, 10)
-            .padding(.bottom, keyboardHeight > 0 ? 18 : -7)
+            .padding(.vertical, 4)
+            .padding(.trailing, 6)
+            .padding(.leading, 3)
+            .liquidGlass(in: RoundedRectangle(cornerRadius: 27, style: .continuous), interactive: true)
+        }
+        .padding(.horizontal, 24)
+        .padding(.top, 10)
+        .padding(.bottom, bottomControlPadding)
+    }
+
+    private var bottomControlPadding: CGFloat {
+        if keyboardHeight > 0 { return 18 }
+        // The negative inset visually balances the taller iPhone home-indicator
+        // safe area. In an iPad window the system edge inset is already small,
+        // so subtracting from it makes the composer touch the window border.
+        return UIDevice.current.userInterfaceIdiom == .pad ? 0 : -7
+    }
+
+    private var isExpectedChatReady: Bool {
+        let isNewChat = expectedThreadID?.hasPrefix("new-") == true
+        return isNewChat || expectedThreadID == viewModel.selectedThreadID
+    }
+
+    private var currentChatContent: ChatScrollContent {
+        guard isExpectedChatReady else { return .empty }
+        return ChatScrollContent(
+            messages: viewModel.renderedMessages,
+            approvals: viewModel.visibleApprovals,
+            active: viewModel.active
+        )
+    }
+
+    private func updateChatContent(force: Bool = false) {
+        guard isExpectedChatReady, !viewModel.isOpeningThread else { return }
+        if isStaticConversationLocked && !force { return }
+        let latest = currentChatContent
+        if !hasLoadedChatContent {
+            beginInitialBottomPositioning()
+            chatContentSnapshot = latest
+            hasLoadedChatContent = true
+            return
+        }
+
+        if isPreparingInitialLayout {
+            // Keep the hidden initial snapshot current while the first layout
+            // settles. Do not enqueue another scroll for every streamed delta.
+            chatContentSnapshot = latest
+            return
+        }
+
+        if force || isFollowingChatBottom {
+            chatContentSnapshot = latest
+            if isFollowingChatBottom {
+                let requestGeneration = scrollToBottomRequest + 1
+                DispatchQueue.main.async {
+                    guard isFollowingChatBottom,
+                          !isPreparingInitialLayout,
+                          !isUserScrollingChat else { return }
+                    scrollToBottomRequest = requestGeneration
+                }
+            }
+        } else {
+            // Leaving follow mode must freeze only the viewport, not the
+            // conversation data. Keep replacing rows that are still being
+            // streamed and append newly arrived rows without requesting a
+            // scroll, so messages and execution commands remain live while
+            // the user reads older content.
+            if shouldReplaceForCompletedProcess(with: latest) {
+                // Completion changes the timeline's structure: fine-grained
+                // live rows are replaced by one process-summary row plus the
+                // final answer. An append-only merge would retain all of the
+                // obsolete live rows. Apply the final snapshot atomically but
+                // deliberately do not request any scroll positioning.
+                chatContentSnapshot = latest
+                return
+            }
+            mergeLiveChatContent(from: latest)
         }
     }
 
-    private var initialScrollContentID: String? {
-        let isNewChat = expectedThreadID?.hasPrefix("new-") == true
-        guard isNewChat || expectedThreadID == viewModel.selectedThreadID else { return nil }
-        return viewModel.renderedMessages.last?.id
+    private func beginInitialBottomPositioning() {
+        initialBottomScrollGeneration += 1
+        let generation = initialBottomScrollGeneration
+        isInitialBottomScrollInProgress = true
+        isPreparingInitialLayout = true
+        DispatchQueue.main.async {
+            guard initialBottomScrollGeneration == generation,
+                  isFollowingChatBottom else { return }
+            scrollToBottomRequest += 1
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            guard initialBottomScrollGeneration == generation else { return }
+            if isFollowingChatBottom && !isUserScrollingChat {
+                // The final native correction runs while the content is still
+                // hidden, so revealing it cannot expose an intermediate offset.
+                _ = chatScrollController.scrollToBottom(animated: false)
+                isAtChatBottom = chatScrollController.isAtBottom()
+            }
+            isInitialBottomScrollInProgress = false
+            isPreparingInitialLayout = false
+            if !viewModel.active {
+                isStaticConversationLocked = true
+            }
+        }
     }
 
-    private var displayedMessages: [ChatMessage] {
-        guard !stableMessages.isEmpty else { return viewModel.renderedMessages }
-        let liveByID = Dictionary(uniqueKeysWithValues: viewModel.liveMessages.map { ($0.id, $0) })
-        var displayed = stableMessages.map { liveByID[$0.id] ?? $0 }
-        let existingIDs = Set(displayed.map(\.id))
-        displayed.append(contentsOf: viewModel.liveMessages.filter { !existingIDs.contains($0.id) })
-        return displayed
+    private func resetChatLayoutForNewThread() {
+        chatScrollController.cancelCurrentScroll()
+        initialBottomScrollGeneration += 1
+        explicitScrollGeneration += 1
+        messagePositioningGeneration += 1
+        processLayoutGeneration += 1
+        scrollTargetMessageID = nil
+        chatContentSnapshot = .empty
+        hasLoadedChatContent = false
+        isStaticConversationLocked = false
+        isPreparingInitialLayout = true
+        isInitialBottomScrollInProgress = false
+        isMessagePositioningInProgress = false
+        isProcessLayoutChangeInProgress = false
+        isAtChatBottom = true
+        isFollowingChatBottom = true
+        isUserScrollingChat = false
+    }
+
+    private func shouldReplaceForCompletedProcess(with latest: ChatScrollContent) -> Bool {
+        let currentIDs = Set(chatContentSnapshot.messages.map(\.id))
+        let latestIDs = Set(latest.messages.map(\.id))
+        let introducedProcessSummary = latest.messages.contains {
+            $0.role == .processSummary && !currentIDs.contains($0.id)
+        }
+        let removesLiveRows = chatContentSnapshot.messages.contains {
+            !latestIDs.contains($0.id)
+        }
+        return introducedProcessSummary && removesLiveRows
+    }
+
+    private func mergeLiveChatContent(from latest: ChatScrollContent) {
+        var latestByID: [String: ChatMessage] = [:]
+        for message in latest.messages {
+            latestByID[message.id] = message
+        }
+
+        let existingIDs = Set(chatContentSnapshot.messages.map(\.id))
+        var messages = chatContentSnapshot.messages.map { current in
+            latestByID[current.id] ?? current
+        }
+        messages.append(contentsOf: latest.messages.filter { !existingIDs.contains($0.id) })
+
+        chatContentSnapshot = ChatScrollContent(
+            messages: messages,
+            approvals: latest.approvals,
+            active: latest.active
+        )
+    }
+
+    private func showLatestChatContent() {
+        beginExplicitScroll()
+        if isFollowingChatBottom {
+            updateChatContent(force: true)
+            return
+        }
+        isFollowingChatBottom = true
+        isAtChatBottom = true
+    }
+
+    private func beginExplicitScroll() {
+        explicitScrollGeneration += 1
+        let generation = explicitScrollGeneration
+        isExplicitScrollInProgress = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
+            guard explicitScrollGeneration == generation else { return }
+            isExplicitScrollInProgress = false
+        }
+    }
+
+    private func beginProcessLayoutChange() {
+        processLayoutGeneration += 1
+        let generation = processLayoutGeneration
+        chatScrollController.cancelCurrentScroll()
+        isFollowingChatBottom = false
+        isProcessLayoutChangeInProgress = true
+
+        // Long histories need several LazyVStack layout passes. During that
+        // window, do not interpret content-height changes as a reason to
+        // resume bottom following.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+            guard processLayoutGeneration == generation else { return }
+            isProcessLayoutChangeInProgress = false
+            isAtChatBottom = chatScrollController.isAtBottom()
+        }
+    }
+
+    private func showMessage(_ messageID: String, highlightQuery: String? = nil) {
+        messagePositioningGeneration += 1
+        isMessagePositioningInProgress = true
+        beginExplicitScroll()
+        chatScrollController.cancelCurrentScroll()
+        isFollowingChatBottom = false
+        isAtChatBottom = false
+        messageTextHighlight = highlightQuery.flatMap { query in
+            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : MessageTextHighlight(messageID: messageID, query: trimmed)
+        }
+        chatContentSnapshot = currentChatContent
+        hasLoadedChatContent = true
+        DispatchQueue.main.async {
+            scrollTargetMessageID = messageID
+        }
+    }
+
+    private func fulfillPendingMessageJumpIfPossible() {
+        guard !viewModel.isOpeningThread,
+              let request = viewModel.pendingMessageJump,
+              request.threadID == viewModel.selectedThreadID,
+              viewModel.renderedMessages.contains(where: { $0.id == request.messageID }) else { return }
+        viewModel.clearMessageJumpRequest()
+        showMessage(request.messageID, highlightQuery: request.query)
     }
 
     private func threadStatus(_ thread: CloudexThread) -> String {
@@ -453,11 +899,238 @@ struct ContentView: View {
         let percent = Int((Double(remaining) / Double(max(1, window)) * 100).rounded())
         return "余 \(percent)%"
     }
+
+    @ViewBuilder
+    private var taskTimerBubble: some View {
+        if !taskTimerHidden, taskTimerTurnID != nil {
+            if let completedAt = taskTimerCompletedAt {
+                taskTimerButton(duration: taskDurationText(at: completedAt), completed: true)
+            } else {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    taskTimerButton(duration: taskDurationText(at: context.date.timeIntervalSince1970), completed: false)
+                }
+            }
+        }
+    }
+
+    private func taskTimerButton(duration: String, completed: Bool) -> some View {
+        Button {
+            let wasCompleted = taskTimerCompletedAt != nil
+            if wasCompleted {
+                taskTimerHidden = true
+                taskTimerTurnID = nil
+            }
+            // Use the same explicit bottom-scroll path as the existing
+            // "latest message" button, including deceleration cancellation.
+            showLatestChatContent()
+        } label: {
+            HStack(spacing: 5) {
+                if completed {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                }
+                Text(duration)
+                    .lineLimit(1)
+            }
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(.plain)
+        .liquidGlass(in: Capsule(), interactive: true)
+        .accessibilityLabel(completed ? "任务已完成，点击查看最新对话" : "任务已用时 \(duration)")
+    }
+
+    private func syncTaskTimerState() {
+        guard isExpectedChatReady else { return }
+        let runningTurn = viewModel.active
+            ? viewModel.detail?.turns.last(where: { turn in
+                guard let status = turn.status?.lowercased() else { return false }
+                return ["inprogress", "in_progress", "active", "running"].contains(status)
+            })
+            : nil
+        if let runningTurn {
+            if taskTimerTurnID == nil || taskTimerCompletedAt != nil || taskTimerTurnID != runningTurn.id {
+                taskTimerTurnID = runningTurn.id
+                taskTimerStartedAt = runningTurn.startedAt ?? Date().timeIntervalSince1970
+                taskTimerCompletedAt = nil
+                taskTimerHidden = false
+            } else if taskTimerStartedAt == nil {
+                taskTimerStartedAt = runningTurn.startedAt ?? Date().timeIntervalSince1970
+            }
+            return
+        }
+
+        // A newly submitted task can be running before the first server
+        // snapshot creates its turn. Start a provisional clock immediately.
+        if viewModel.liveRunning && (taskTimerTurnID == nil || taskTimerCompletedAt != nil) {
+            taskTimerTurnID = "pending-\(viewModel.selectedThreadID ?? "new")"
+            taskTimerStartedAt = Date().timeIntervalSince1970
+            taskTimerCompletedAt = nil
+            taskTimerHidden = false
+            return
+        }
+
+        guard let taskTimerTurnID,
+              !taskTimerTurnID.hasPrefix("pending-") else {
+            if !viewModel.liveRunning { taskTimerCompletedAt = taskTimerCompletedAt ?? Date().timeIntervalSince1970 }
+            return
+        }
+        guard let turn = viewModel.detail?.turns.first(where: { $0.id == taskTimerTurnID }) else { return }
+        guard let status = turn.status?.lowercased(),
+              !["inprogress", "in_progress", "active", "running"].contains(status) else { return }
+        if taskTimerCompletedAt == nil {
+            let fallback = taskTimerStartedAt.map { $0 + (turn.durationMs ?? 0) / 1000 }
+            taskTimerCompletedAt = turn.completedAt ?? fallback ?? Date().timeIntervalSince1970
+            taskTimerHidden = false
+        }
+    }
+
+    private func taskDurationText(at timestamp: Double) -> String {
+        guard let started = taskTimerStartedAt else { return "0秒" }
+        return DateFormatting.duration(fromSeconds: max(0, timestamp - started))
+    }
+}
+
+private struct ChatScrollContent: Equatable {
+    let messages: [ChatMessage]
+    let approvals: [ApprovalRequest]
+    let active: Bool
+
+    static let empty = ChatScrollContent(messages: [], approvals: [], active: false)
+}
+
+private final class ChatScrollController: ObservableObject {
+    private weak var scrollView: UIScrollView?
+
+    func attach(_ scrollView: UIScrollView) {
+        self.scrollView = scrollView
+    }
+
+    func detach() {
+        scrollView = nil
+    }
+
+    func isAtBottom(tolerance: CGFloat = 24) -> Bool {
+        guard let scrollView, scrollView.window != nil else { return false }
+        scrollView.layoutIfNeeded()
+        let minimumY = -scrollView.adjustedContentInset.top
+        let maximumY = max(
+            minimumY,
+            scrollView.contentSize.height
+                - scrollView.bounds.height
+                + scrollView.adjustedContentInset.bottom
+        )
+        return maximumY - scrollView.contentOffset.y <= tolerance
+    }
+
+    @discardableResult
+    func scrollToBottom(animated: Bool) -> Bool {
+        guard let scrollView, scrollView.window != nil else { return false }
+
+        // Stop both an active drag and any remaining deceleration before
+        // starting the explicit navigation animation. Toggling the pan
+        // recognizer forces UIKit to cancel the gesture immediately.
+        let currentOffset = scrollView.contentOffset
+        scrollView.layer.removeAllAnimations()
+        scrollView.setContentOffset(currentOffset, animated: false)
+        scrollView.panGestureRecognizer.isEnabled = false
+        scrollView.panGestureRecognizer.isEnabled = true
+        scrollView.layoutIfNeeded()
+
+        let minimumY = -scrollView.adjustedContentInset.top
+        let maximumY = max(
+            minimumY,
+            scrollView.contentSize.height
+                - scrollView.bounds.height
+                + scrollView.adjustedContentInset.bottom
+        )
+        scrollView.setContentOffset(
+            CGPoint(x: scrollView.contentOffset.x, y: maximumY),
+            animated: animated
+        )
+        return true
+    }
+
+    func cancelCurrentScroll() {
+        guard let scrollView, scrollView.window != nil else { return }
+        let currentOffset = scrollView.contentOffset
+        scrollView.layer.removeAllAnimations()
+        scrollView.setContentOffset(currentOffset, animated: false)
+        // Cancel both a finger-owned gesture and UIKit deceleration. The
+        // search positioning transaction takes ownership immediately after.
+        scrollView.panGestureRecognizer.isEnabled = false
+        scrollView.panGestureRecognizer.isEnabled = true
+    }
+}
+
+private struct ChatScrollViewResolver: UIViewRepresentable {
+    let controller: ChatScrollController
+
+    func makeUIView(context: Context) -> ResolverView {
+        ResolverView(controller: controller)
+    }
+
+    func updateUIView(_ uiView: ResolverView, context: Context) {
+        uiView.controller = controller
+        uiView.resolveScrollView()
+    }
+
+    static func dismantleUIView(_ uiView: ResolverView, coordinator: ()) {
+        uiView.controller.detach()
+    }
+
+    final class ResolverView: UIView {
+        var controller: ChatScrollController
+
+        init(controller: ChatScrollController) {
+            self.controller = controller
+            super.init(frame: .zero)
+            isUserInteractionEnabled = false
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        override func didMoveToSuperview() {
+            super.didMoveToSuperview()
+            resolveScrollView()
+        }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            resolveScrollView()
+        }
+
+        func resolveScrollView() {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                var ancestor = self.superview
+                while let view = ancestor {
+                    if let scrollView = view as? UIScrollView {
+                        self.controller.attach(scrollView)
+                        return
+                    }
+                    ancestor = view.superview
+                }
+            }
+        }
+    }
 }
 
 private extension View {
     @ViewBuilder
-    func trackChatBottom(_ isAtBottom: Binding<Bool>) -> some View {
+    func trackChatScroll(
+        isAtBottom: Binding<Bool>,
+        isFollowingBottom: Binding<Bool>,
+        isExplicitScrollInProgress: Binding<Bool>,
+        isUserScrolling: Binding<Bool>,
+        isLayoutChangeInProgress: Binding<Bool>,
+        isFollowRestorationDisabled: @escaping () -> Bool,
+        nativeIsAtBottom: @escaping () -> Bool
+    ) -> some View {
         if #available(iOS 18.0, *) {
             self.onScrollGeometryChange(for: Bool.self) { geometry in
                 let visibleBottom = geometry.contentOffset.y + geometry.containerSize.height
@@ -465,9 +1138,70 @@ private extension View {
                 return geometry.contentSize.height <= geometry.containerSize.height || distanceToBottom <= 24
             } action: { _, atBottom in
                 isAtBottom.wrappedValue = atBottom
+                // Scroll geometry can deliver its final bottom value just
+                // after the phase changes to idle. Restore follow mode here
+                // as well so that event ordering cannot leave a stale button.
+                if atBottom
+                    && !isUserScrolling.wrappedValue
+                    && !isLayoutChangeInProgress.wrappedValue
+                    && !isExplicitScrollInProgress.wrappedValue
+                    && !isFollowRestorationDisabled() {
+                    isFollowingBottom.wrappedValue = true
+                }
+            }
+            .onScrollPhaseChange { _, phase in
+                switch phase {
+                case .tracking, .interacting, .decelerating:
+                    guard !isExplicitScrollInProgress.wrappedValue else { break }
+                    isUserScrolling.wrappedValue = true
+                    // Any user-initiated scroll leaves follow mode. Do not
+                    // automatically restore it when scrolling becomes idle:
+                    // an upward drag that starts at the bottom can still be
+                    // reported as "at bottom" for a moment, which previously
+                    // caused the next content update to jump back down.
+                    // Follow mode is restored only after the gesture really
+                    // settles at the bottom (see the idle case below), or by
+                    // showLatestChatContent().
+                    isFollowingBottom.wrappedValue = false
+                case .idle:
+                    isUserScrolling.wrappedValue = false
+                    // SwiftUI's geometry can lag behind the final rubber-band
+                    // position. Reconcile against the underlying UIScrollView
+                    // now and once more on the next run loop after layout.
+                    let reconcileBottom = {
+                        let atBottom = nativeIsAtBottom()
+                        isAtBottom.wrappedValue = atBottom
+                        if atBottom
+                            && !isLayoutChangeInProgress.wrappedValue
+                            && !isExplicitScrollInProgress.wrappedValue
+                            && !isFollowRestorationDisabled() {
+                            isFollowingBottom.wrappedValue = true
+                        }
+                    }
+                    reconcileBottom()
+                    DispatchQueue.main.async(execute: reconcileBottom)
+                default:
+                    break
+                }
             }
         } else {
-            self
+            self.simultaneousGesture(
+                DragGesture(minimumDistance: 2)
+                    .onChanged { _ in
+                        guard !isExplicitScrollInProgress.wrappedValue else { return }
+                        isUserScrolling.wrappedValue = true
+                        isAtBottom.wrappedValue = false
+                        isFollowingBottom.wrappedValue = false
+                    }
+                    .onEnded { _ in
+                        isUserScrolling.wrappedValue = false
+                        if isAtBottom.wrappedValue
+                            && !isExplicitScrollInProgress.wrappedValue
+                            && !isFollowRestorationDisabled() {
+                            isFollowingBottom.wrappedValue = true
+                        }
+                    }
+            )
         }
     }
 }
@@ -520,8 +1254,13 @@ private struct TokenUsageSheet: View {
 
 private struct MessageBubble: View {
     let message: ChatMessage
+    let highlightQuery: String?
     @Binding var collapseRequest: Int
+    let onQuickFill: (String) -> Void
+    let onFork: () async -> Bool
+    let onProcessInteraction: () -> Void
     let onFloatingStateChange: (Bool) -> Void
+    @State private var isPerformingAction = false
 
     @ViewBuilder
     var body: some View {
@@ -531,6 +1270,7 @@ private struct MessageBubble: View {
             ProcessSummaryBubble(
                 message: message,
                 collapseRequest: $collapseRequest,
+                onInteraction: onProcessInteraction,
                 onFloatingStateChange: onFloatingStateChange
             )
         } else if message.role == .taskSummary || message.role == .compressed || message.role == .system {
@@ -542,16 +1282,13 @@ private struct MessageBubble: View {
                     Text(roleTitle)
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(message.role == .error ? Color.red : Color.secondary)
-                    MarkdownText(text: message.text)
+                    MarkdownText(text: message.text, highlightQuery: highlightQuery)
                         .font(.body)
                         .foregroundStyle(message.role == .error ? Color.red : Color.primary)
                         .multilineTextAlignment(.leading)
                         .textSelection(.enabled)
-                    if !messageTime.isEmpty {
-                        Text(messageTime)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
+
+                    messageFooter
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 11)
@@ -592,12 +1329,72 @@ private struct MessageBubble: View {
     private var messageTime: String {
         DateFormatting.messageTime(from: message.createdAt)
     }
+
+    @ViewBuilder
+    private var messageFooter: some View {
+        HStack(spacing: 6) {
+            if !messageTime.isEmpty {
+                Text(messageTime)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 10)
+
+            if message.role == .user || message.role == .assistant {
+                Button {
+                    UIPasteboard.general.string = message.text
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .frame(width: 28, height: 24)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("复制消息")
+
+                if message.role == .user {
+                    Button {
+                        onQuickFill(message.text)
+                    } label: {
+                        Image(systemName: "arrow.down.to.line")
+                            .frame(width: 28, height: 24)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .disabled(isPerformingAction)
+                    .accessibilityLabel("填充到输入框")
+                } else {
+                    Button {
+                        Task {
+                            isPerformingAction = true
+                            _ = await onFork()
+                            isPerformingAction = false
+                        }
+                    } label: {
+                        if isPerformingAction {
+                            ProgressView().controlSize(.mini)
+                                .frame(width: 28, height: 24)
+                        } else {
+                            Image(systemName: "arrow.triangle.branch")
+                                .frame(width: 28, height: 24)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .disabled(message.sourceTurnID == nil || isPerformingAction)
+                    .accessibilityLabel("从这里分叉对话")
+                }
+            }
+        }
+        .font(.caption)
+    }
 }
 
 private struct ProcessSummaryBubble: View {
     @EnvironmentObject private var viewModel: AppViewModel
     let message: ChatMessage
     @Binding var collapseRequest: Int
+    let onInteraction: () -> Void
     let onFloatingStateChange: (Bool) -> Void
     @State private var expanded = false
     @State private var expansionGeneration = 0
@@ -610,20 +1407,20 @@ private struct ProcessSummaryBubble: View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 8) {
                 Button {
+                    onInteraction()
                     if expanded {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            expanded = false
-                            expansionGeneration += 1
-                        }
+                        expanded = false
+                        expansionGeneration += 1
                     } else if message.processDetailsLoaded {
-                        withAnimation(.easeInOut(duration: 0.2)) { expanded = true }
+                        expanded = true
                     } else if let turnID = message.sourceTurnID, !loadingDetails {
                         loadingDetails = true
                         Task {
                             let loaded = await viewModel.loadTurnDetails(turnID: turnID)
                             loadingDetails = false
                             if loaded {
-                                withAnimation(.easeInOut(duration: 0.2)) { expanded = true }
+                                onInteraction()
+                                expanded = true
                             }
                         }
                     }
@@ -682,7 +1479,6 @@ private struct ProcessSummaryBubble: View {
                             Color.clear.preference(key: ProcessContentHeightKey.self, value: geometry.size.height)
                         }
                     }
-                    .transition(.opacity.combined(with: .move(edge: .top)))
                 }
                 let time = DateFormatting.messageTime(from: message.createdAt)
                 if !time.isEmpty {
@@ -693,10 +1489,17 @@ private struct ProcessSummaryBubble: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
+            // Keep the expanded process content constrained to the same
+            // bubble width as its header. Without an explicit finite width,
+            // long shell commands and diff rows can make the VStack choose
+            // an intrinsic width larger than the rounded rectangle.
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
             Spacer(minLength: 32)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .onChange(of: message.id) { _, _ in
             expanded = false
             expansionGeneration += 1
@@ -718,10 +1521,9 @@ private struct ProcessSummaryBubble: View {
         }
         .onChange(of: collapseRequest) { _, _ in
             guard expanded else { return }
-            withAnimation(.easeInOut(duration: 0.2)) {
-                expanded = false
-                expansionGeneration += 1
-            }
+            onInteraction()
+            expanded = false
+            expansionGeneration += 1
             onFloatingStateChange(false)
         }
         .onDisappear {
@@ -810,6 +1612,7 @@ private struct SystemTimelineBubble: View {
 
 private struct MarkdownText: View {
     let text: String
+    var highlightQuery: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -818,7 +1621,7 @@ private struct MarkdownText: View {
                 if value.isEmpty {
                     Color.clear.frame(height: 5)
                 } else {
-                    Text(Self.parseLine(value))
+                    Text(Self.parseLine(value, highlightQuery: highlightQuery))
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
@@ -826,9 +1629,10 @@ private struct MarkdownText: View {
         .fixedSize(horizontal: false, vertical: true)
     }
 
-    private static func parseLine(_ text: String) -> AttributedString {
+    private static func parseLine(_ text: String, highlightQuery: String?) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
-        return (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        let parsed = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        return highlightedAttributedString(parsed, query: highlightQuery)
     }
 }
 
@@ -840,42 +1644,96 @@ private struct ExecutionStepRow: View {
         Button {
             withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
         } label: {
-            HStack(alignment: .top, spacing: 10) {
-                statusIcon
-                    .frame(width: 18, height: 20)
+            if message.executionKind == "edit" {
+                editRow
+            } else {
+                HStack(alignment: .top, spacing: 10) {
+                    statusIcon
+                        .frame(width: 18, height: 20)
 
-                VStack(alignment: .leading, spacing: 5) {
-                    if message.executionKind == "edit" {
-                        EditDiffView(text: message.text, diff: message.editDiff, expanded: expanded)
-                    } else {
-                        Text(message.text)
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(message.text)
                             .font(.system(.subheadline, design: .monospaced).weight(.medium))
                             .foregroundStyle(.primary)
                             .lineLimit(expanded ? nil : 3)
                             .multilineTextAlignment(.leading)
                             .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if let detailText {
+                            Text(detailText)
+                                .font(.caption2)
+                                .foregroundStyle(statusColor)
+                        }
                     }
-
-                    if let detailText {
-                        Text(detailText)
-                            .font(.caption2)
-                            .foregroundStyle(statusColor)
+                    Spacer(minLength: 0)
+                    if canExpand {
+                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 3)
                     }
                 }
-                Spacer(minLength: 0)
-                if canExpand {
-                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .padding(.top, 3)
-                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(.plain)
+    }
+
+    private var editRow: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                statusIcon
+                    .frame(width: 18, height: 20)
+                Text(editTitle)
+                    .font(.system(.subheadline, design: .monospaced).weight(.medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(nil)
+                    .multilineTextAlignment(.leading)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Spacer(minLength: 8)
+                if hasEditDiff {
+                    Text("+\(totalEditAdditions) -\(totalEditDeletions)")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 8)
+
+            if hasEditDiff && expanded {
+                CodexStyleDiffRenderer(payloads: editPayloads, expanded: expanded)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else if !hasEditDiff {
+                Text(message.text)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(expanded ? nil : 4)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 12)
+            }
+
+            if let detailText {
+                Text(detailText)
+                    .font(.caption2)
+                    .foregroundStyle(statusColor)
+                    .padding(.leading, 40)
+                    .padding(.trailing, 12)
+                    .padding(.top, 6)
+            }
+        }
+        .padding(.bottom, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
     @ViewBuilder
@@ -883,13 +1741,17 @@ private struct ExecutionStepRow: View {
         if message.executionStatus == "inProgress" {
             ProgressView().controlSize(.small)
         } else {
-            Image(systemName: message.executionStatus == "failed" ? "xmark.circle.fill" : "checkmark.circle.fill")
+            Image(systemName: message.executionStatus == "failed" || message.executionStatus == "declined"
+                  ? "xmark.circle.fill"
+                  : "checkmark.circle.fill")
                 .foregroundStyle(statusColor)
         }
     }
 
     private var statusColor: Color {
-        message.executionStatus == "failed" ? .red : (message.executionStatus == "inProgress" ? .secondary : .green)
+        if message.executionStatus == "failed" { return .red }
+        if message.executionStatus == "declined" { return .orange }
+        return message.executionStatus == "inProgress" ? .secondary : .green
     }
 
     private var detailText: String? {
@@ -906,72 +1768,35 @@ private struct ExecutionStepRow: View {
         if message.executionKind == "edit" { return true }
         return message.text.count > 100 || message.text.contains("\n")
     }
-}
 
-private struct EditDiffView: View {
-    let text: String
-    let diff: [EditDiffPayload]?
-    let expanded: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Image(systemName: "square.and.pencil")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.blue)
-                Text(title)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(nil)
-                Spacer(minLength: 8)
-                if hasDiffPayload {
-                    Text("+\(totalAdditions) -\(totalDeletions)")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
-            }
-
-            if hasDiffPayload && expanded {
-                CodexStyleDiffRenderer(payloads: payloads, expanded: expanded)
-            } else {
-                Text(hasDiffPayload ? "点击展开修改内容" : text)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(hasDiffPayload ? 1 : (expanded ? nil : 4))
-                    .textSelection(.enabled)
-            }
-        }
-    }
-
-    private var title: String {
-        let names = payloads.map { displayName($0.name) }
-        guard !names.isEmpty else { return text }
+    private var editTitle: String {
+        let names = editPayloads.map { editDisplayName($0.name) }
+        guard !names.isEmpty else { return message.text }
         if names.count <= 2 { return "Edited \(names.joined(separator: ", "))" }
         return "Edited \(names.prefix(2).joined(separator: ", ")) and \(names.count - 2) more"
     }
 
-    private var payloads: [EditDiffPayload] {
-        diff ?? []
+    private var editPayloads: [EditDiffPayload] {
+        message.editDiff ?? []
     }
 
-    private var hasDiffPayload: Bool {
-        !payloads.isEmpty
+    private var hasEditDiff: Bool {
+        !editPayloads.isEmpty
     }
 
-    private var totalAdditions: Int {
-        payloads.reduce(0) { total, payload in
+    private var totalEditAdditions: Int {
+        editPayloads.reduce(0) { total, payload in
             total + (payload.additions ?? payload.lines?.filter { $0.kind == "addition" }.count ?? 0)
         }
     }
 
-    private var totalDeletions: Int {
-        payloads.reduce(0) { total, payload in
+    private var totalEditDeletions: Int {
+        editPayloads.reduce(0) { total, payload in
             total + (payload.deletions ?? payload.lines?.filter { $0.kind == "deletion" }.count ?? 0)
         }
     }
 
-    private func displayName(_ value: String) -> String {
+    private func editDisplayName(_ value: String) -> String {
         let name = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return "files" }
         return (name as NSString).lastPathComponent
@@ -1296,77 +2121,273 @@ private struct ApprovalBubble: View {
     }
 }
 
-private struct ChatNavigationTitle: View, Equatable {
+private struct MessageJumpItem: Identifiable, Equatable {
+    let id: String
+    let turnID: String
     let title: String
-    let projectTitle: String
-    let isConnected: Bool
-    let messages: [MessageJumpItem]
-    let onSelect: (MessageJumpItem) -> Void
+    let body: String
+    let dateTime: String
+    let processingDuration: String
 
-    static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.title == rhs.title &&
-        lhs.projectTitle == rhs.projectTitle &&
-        lhs.isConnected == rhs.isConnected &&
-        lhs.messages == rhs.messages
-    }
+    static func paired(from items: [MessageIndexItem], turns: [CloudexTurn]) -> [MessageJumpItem] {
+        var result: [MessageJumpItem] = []
+        var pendingUser: MessageIndexItem?
+        let turnsByID = Dictionary(uniqueKeysWithValues: turns.map { ($0.id, $0) })
 
-    var body: some View {
-        Menu {
-            if messages.isEmpty {
-                Text("暂无发送信息")
-            } else {
-                ForEach(messages) { message in
-                    Button {
-                        onSelect(message)
-                    } label: {
-                        Text("\(message.roleTitle) · \(message.text)")
-                            .lineLimit(1)
-                    }
-                }
-            }
-        } label: {
-            VStack(spacing: 0) {
-                Text(title)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(isConnected ? Color.green : Color.red)
-                        .frame(width: 7, height: 7)
-                    Text(projectTitle)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-            .frame(maxWidth: 190)
-            .frame(height: 36)
-            .padding(.horizontal, 15)
-            .contentShape(Capsule())
-            .liquidGlass(in: Capsule(), interactive: true)
-            .shadow(color: .black.opacity(0.08), radius: 14, y: 5)
-            .padding(.vertical, 4)
+        func makeItem(user: MessageIndexItem, assistant: MessageIndexItem?) -> MessageJumpItem {
+            let turn = turnsByID[user.turnId]
+            let duration = turn?.durationMs.flatMap { DateFormatting.duration(fromMilliseconds: $0).nilIfEmpty }
+                ?? {
+                    guard let startedAt = user.createdAt,
+                          let completedAt = assistant?.createdAt,
+                          completedAt >= startedAt else { return nil }
+                    return DateFormatting.duration(fromSeconds: completedAt - startedAt).nilIfEmpty
+                }()
+                ?? ""
+            return MessageJumpItem(
+                id: user.id,
+                turnID: user.turnId,
+                title: user.text,
+                body: assistant?.text ?? "",
+                dateTime: DateFormatting.string(from: user.createdAt),
+                processingDuration: duration
+            )
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("打开消息菜单")
+
+        for item in items {
+            if item.role == "user" {
+                if let pendingUser {
+                    result.append(makeItem(user: pendingUser, assistant: nil))
+                }
+                pendingUser = item
+            } else if let user = pendingUser {
+                result.append(makeItem(user: user, assistant: item))
+                pendingUser = nil
+            }
+        }
+
+        if let pendingUser {
+            result.append(makeItem(user: pendingUser, assistant: nil))
+        }
+        return result
     }
 }
 
-private struct MessageJumpItem: Identifiable, Equatable {
-    let id: String
-    let roleTitle: String
-    let text: String
+struct IPadConversationDirectoryView: View {
+    @EnvironmentObject private var viewModel: AppViewModel
+    let onSelect: (_ messageID: String, _ turnID: String) -> Void
+    let onOpenPage: (() -> Void)?
+    let onClosePage: (() -> Void)?
+    var showsNavigationChrome = true
+    @State private var messages: [MessageJumpItem] = []
 
-    init(item: MessageIndexItem) {
-        id = item.id
-        roleTitle = item.role == "user" ? "你" : "Codex"
-        text = item.text
+    @ViewBuilder
+    var body: some View {
+        Group {
+            if showsNavigationChrome {
+                NavigationStack {
+                    directoryContent
+                        .toolbar {
+                            if let onClosePage {
+                                ToolbarItem(placement: .topBarLeading) {
+                                    Button(action: onClosePage) {
+                                        Image(systemName: "chevron.left")
+                                    }
+                                    .accessibilityLabel("返回三栏视图")
+                                }
+                            }
+                        }
+                }
+            } else {
+                directoryContent
+            }
+        }
+        .onChange(of: viewModel.messageIndex, initial: true) { _, items in
+            guard !viewModel.active || messages.isEmpty else { return }
+            let snapshot = MessageJumpItem.paired(from: items, turns: viewModel.detail?.turns ?? [])
+            if messages != snapshot { messages = snapshot }
+        }
+        .onChange(of: viewModel.active) { _, active in
+            guard !active else { return }
+            let snapshot = MessageJumpItem.paired(
+                from: viewModel.messageIndex,
+                turns: viewModel.detail?.turns ?? []
+            )
+            if messages != snapshot { messages = snapshot }
+        }
+    }
+
+    private var directoryContent: some View {
+        MessageJumpListView(
+            messages: messages,
+            onSelect: { onSelect($0.id, $0.turnID) },
+            onExpand: onOpenPage,
+            dismissOnSelection: false,
+            showsNavigationChrome: showsNavigationChrome
+        )
+        .environmentObject(viewModel)
+    }
+}
+
+private struct MessageJumpListView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var viewModel: AppViewModel
+    let messages: [MessageJumpItem]
+    let onSelect: (MessageJumpItem) -> Void
+    var onExpand: (() -> Void)? = nil
+    var dismissOnSelection = true
+    var showsNavigationChrome = true
+    @State private var pendingSelection: MessageJumpItem?
+    @State private var selectedSubpage = ConversationSubpage.conversation
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("页面", selection: $selectedSubpage) {
+                Label("对话", systemImage: "bubble.left.and.bubble.right")
+                    .tag(ConversationSubpage.conversation)
+                Label("文件", systemImage: "folder")
+                    .tag(ConversationSubpage.files)
+                Label("浏览器", systemImage: "safari")
+                    .tag(ConversationSubpage.browser)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(.bar)
+
+            ZStack {
+                conversationDirectory
+                    .opacity(selectedSubpage == .conversation ? 1 : 0)
+                    .allowsHitTesting(selectedSubpage == .conversation)
+                    .accessibilityHidden(selectedSubpage != .conversation)
+
+                WorkspaceFilesView(rootPath: workspaceRoot)
+                    .environmentObject(viewModel)
+                    .id(workspaceRoot)
+                    .opacity(selectedSubpage == .files ? 1 : 0)
+                    .allowsHitTesting(selectedSubpage == .files)
+                    .accessibilityHidden(selectedSubpage != .files)
+
+                WorkspaceBrowserView()
+                    .opacity(selectedSubpage == .browser ? 1 : 0)
+                    .allowsHitTesting(selectedSubpage == .browser)
+                    .accessibilityHidden(selectedSubpage != .browser)
+            }
+        }
+        .modifier(DirectoryNavigationChromeModifier(
+            isVisible: showsNavigationChrome,
+            onExpand: onExpand
+        ))
+        .onDisappear {
+            guard let selection = pendingSelection else { return }
+            pendingSelection = nil
+            // Wait until the pop transition has handed scrolling back to the
+            // parent conversation before starting its explicit positioning.
+            DispatchQueue.main.async {
+                onSelect(selection)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var conversationDirectory: some View {
+        if messages.isEmpty {
+            ContentUnavailableView("暂无对话", systemImage: "text.bubble")
+        } else {
+            List(messages) { message in
+                Button {
+                    if dismissOnSelection {
+                        pendingSelection = message
+                        dismiss()
+                    } else {
+                        onSelect(message)
+                    }
+                } label: {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(normalizedText(message.title))
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                            .lineLimit(3)
+                            .multilineTextAlignment(.leading)
+
+                        Text(message.body.isEmpty ? "暂无 Codex 回复" : normalizedText(message.body))
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                            .multilineTextAlignment(.leading)
+
+                        HStack(spacing: 10) {
+                            Text(message.dateTime)
+                            Spacer(minLength: 8)
+                            Text(message.processingDuration.isEmpty
+                                 ? "处理中"
+                                 : "处理 \(message.processingDuration)")
+                        }
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .monospacedDigit()
+                    }
+                    .padding(.vertical, 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("跳转到：\(normalizedText(message.title))")
+            }
+        }
+    }
+
+    private var workspaceRoot: String {
+        viewModel.selectedProjectCWD
+            ?? viewModel.selectedThread?.cwd
+            ?? ""
+    }
+
+    private func normalizedText(_ source: String) -> String {
+        source
+            .replacingOccurrences(of: "\n", with: " ")
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+    }
+}
+
+private struct DirectoryNavigationChromeModifier: ViewModifier {
+    let isVisible: Bool
+    let onExpand: (() -> Void)?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isVisible {
+            content
+                .navigationTitle("对话目录")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    if let onExpand {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button(action: onExpand) {
+                                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            }
+                            .accessibilityLabel("打开对话目录页面")
+                        }
+                    }
+                }
+                .toolbar(.visible, for: .navigationBar)
+        } else {
+            content
+        }
     }
 }
 
 private extension View {
+    @ViewBuilder
+    func nativeTopScrollEdgeEffect() -> some View {
+        if #available(iOS 26.0, *) {
+            self.scrollEdgeEffectStyle(.soft, for: .top)
+        } else {
+            self
+        }
+    }
+
     @ViewBuilder
     func liquidGlass<S: Shape>(
         in shape: S,

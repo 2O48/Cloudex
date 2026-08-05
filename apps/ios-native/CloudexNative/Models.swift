@@ -1,4 +1,37 @@
 import Foundation
+import SwiftUI
+
+struct MessageTextHighlight: Equatable {
+    let messageID: String
+    let query: String
+}
+
+func highlightedAttributedString(_ text: String, query: String?) -> AttributedString {
+    highlightedAttributedString(AttributedString(text), query: query)
+}
+
+func highlightedAttributedString(_ source: AttributedString, query: String?) -> AttributedString {
+    guard let query else { return source }
+    let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return source }
+
+    var result = source
+    let plainText = String(result.characters)
+    var searchStart = plainText.startIndex
+    while searchStart < plainText.endIndex,
+          let match = plainText.range(
+              of: trimmed,
+              options: [.caseInsensitive, .diacriticInsensitive],
+              range: searchStart..<plainText.endIndex
+          ) {
+        guard let lower = AttributedString.Index(match.lowerBound, within: result),
+              let upper = AttributedString.Index(match.upperBound, within: result) else { break }
+        result[lower..<upper].foregroundColor = .white
+        result[lower..<upper].backgroundColor = .blue
+        searchStart = match.upperBound
+    }
+    return result
+}
 
 enum ConnectionMode: String, CaseIterable, Identifiable, Codable {
     case automatic
@@ -37,7 +70,11 @@ struct ConnectionHistoryItem: Codable, Identifiable, Equatable {
     }
 
     var maskedToken: String {
-        guard token.count > 8 else { return String(repeating: "•", count: max(4, token.count)) }
+        let characters = Array(token)
+        guard characters.count > 8 else {
+            guard characters.count > 4 else { return String(repeating: "•", count: max(4, characters.count)) }
+            return "\(String(characters.prefix(4)))••••\(String(characters.suffix(4)))"
+        }
         return "\(token.prefix(4))••••\(token.suffix(4))"
     }
 }
@@ -53,6 +90,13 @@ struct ProjectSnapshot: Codable {
 
 struct ApprovalsResponse: Codable {
     let data: [ApprovalRequest]
+}
+
+struct ApprovalResolvedEvent: Codable {
+    let id: String
+    let threadId: String?
+    let decision: String?
+    let approval: ApprovalRequest?
 }
 
 enum ApprovalDecision: String {
@@ -267,6 +311,33 @@ struct MessageIndexItem: Codable, Identifiable, Equatable {
     let createdAt: Double?
 }
 
+struct ConversationSearchResponse: Codable {
+    let data: [ConversationSearchMatch]
+}
+
+struct ConversationSearchMatch: Codable, Identifiable, Equatable {
+    let id: String
+    let threadId: String
+    let messageId: String
+    let turnId: String
+    let role: String
+    let text: String
+    let snippet: String
+    let createdAt: Double?
+}
+
+struct PendingMessageJump: Equatable {
+    let threadID: String
+    let messageID: String
+    let turnID: String
+    let query: String
+}
+
+struct ThreadNavigationRequest: Equatable {
+    let id = UUID()
+    let threadID: String
+}
+
 struct CloudexTurn: Codable, Equatable {
     let id: String
     let items: [TurnItem]?
@@ -279,6 +350,15 @@ struct CloudexTurn: Codable, Equatable {
     let itemsView: String?
     var processItemCount: Int? = nil
     var detailsLoaded: Bool? = nil
+
+    var processDetailsAreLoaded: Bool {
+        if let detailsLoaded { return detailsLoaded }
+        switch itemsView?.lowercased() {
+        case "full": return true
+        case "compact": return false
+        default: return (processItemCount ?? 0) == 0
+        }
+    }
 }
 
 struct TurnDetailResponse: Codable {
@@ -498,6 +578,10 @@ struct ReasoningEffortOption: Codable, Equatable, Identifiable {
 }
 
 struct CreateThreadResponse: Codable {
+    let thread: CloudexThread
+}
+
+struct ForkThreadResponse: Codable {
     let thread: CloudexThread
 }
 

@@ -56,6 +56,10 @@ final class SSEClient: NSObject, URLSessionDataDelegate {
         didReceive response: URLResponse,
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
+        guard dataTask === task else {
+            completionHandler(.cancel)
+            return
+        }
         guard let http = response as? HTTPURLResponse else {
             reportedStatusError = "实时连接响应无效"
             completionHandler(.cancel)
@@ -71,6 +75,7 @@ final class SSEClient: NSObject, URLSessionDataDelegate {
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard dataTask === task else { return }
         pendingData.append(data)
         let separator = Data([0x0A, 0x0A])
         while let range = pendingData.range(of: separator) {
@@ -81,6 +86,11 @@ final class SSEClient: NSObject, URLSessionDataDelegate {
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        // Cancelling an old stream is asynchronous. Its completion callback
+        // can arrive after start() has already installed a replacement task.
+        // Ignore that stale callback so it cannot report or reconnect over
+        // the healthy replacement stream.
+        guard task === self.task else { return }
         guard !intentionallyStopped else { return }
         let message = reportedStatusError ?? error?.localizedDescription ?? "实时连接已关闭"
         onDisconnect?(message)

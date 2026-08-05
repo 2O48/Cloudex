@@ -29,6 +29,8 @@ final class AppViewModel: ObservableObject {
     @Published var pendingApprovals: [ApprovalRequest] = []
     @Published var systemMessages: [ChatMessage] = [] { didSet { rebuildRenderedMessages() } }
     @Published var messageIndex: [MessageIndexItem] = []
+    @Published var pendingMessageJump: PendingMessageJump?
+    @Published var threadNavigationRequest: ThreadNavigationRequest?
     @Published var notifyApprovals: Bool
     @Published var notifyTaskSuccess: Bool
     @Published var notifyTaskFailure: Bool
@@ -47,6 +49,8 @@ final class AppViewModel: ObservableObject {
     private var threadStreamReplaying = false
     private var detailLoadGeneration = 0
     private var liveMessageTurnIDs: [String: String] = [:]
+    private var suppressedCompactionMessageIDs = Set<String>()
+    private var liveOrderingClock: Double = 0
     private var activeTurnNotificationKeys: [String: String] = [:]
     private var sentTaskResultNotificationKeys = Set<String>()
 
@@ -75,7 +79,9 @@ final class AppViewModel: ObservableObject {
         authToken = savedToken.isEmpty || savedToken == "lW0FcVb_finDkfBpW0wHKtGh6lmAXw1t"
             ? "GASPMZC_06BAFN2o0T9rY3BNTtAhsVTu"
             : savedToken
-        selectedModelID = defaults.string(forKey: "cloudex.model") ?? ""
+        // The Codex CLI config is authoritative on each launch. An in-app
+        // selection still applies for the current run and subsequent turns.
+        selectedModelID = ""
         selectedEffortID = defaults.string(forKey: "cloudex.effort") ?? ""
         notifyApprovals = defaults.object(forKey: "cloudex.notifyApprovals") as? Bool ?? true
         notifyTaskSuccess = defaults.object(forKey: "cloudex.notifyTaskSuccess") as? Bool ?? true
@@ -105,7 +111,8 @@ final class AppViewModel: ObservableObject {
         availableEfforts.first { $0.reasoningEffort == selectedEffortID }?.title ?? "默认"
     }
     var compactModelTitle: String {
-        let title = selectedModel?.title ?? (modelsLoading ? "读取中" : "模型")
+        let title = selectedModel?.title
+            ?? (!selectedModelID.isEmpty ? selectedModelID : (modelsLoading ? "读取中" : "模型"))
         return title
             .replacingOccurrences(of: "GPT-", with: "")
             .replacingOccurrences(of: "gpt-", with: "")
@@ -176,12 +183,12 @@ final class AppViewModel: ObservableObject {
                     result.append(ChatMessage(
                         id: "\(turn.id)-process-summary",
                         role: .processSummary,
-                        text: processSummaryText(processItems, totalCount: turn.processItemCount),
+                        text: processSummaryText(processItems),
                         processItems: processItems,
                         createdAt: processItems.compactMap(\.createdAt).min(),
                         sourceTurnID: turn.id,
                         processItemCount: turn.processItemCount,
-                        processDetailsLoaded: turn.detailsLoaded ?? true
+                        processDetailsLoaded: turn.processDetailsAreLoaded
                     ))
                 }
                 if let finalMessage { result.append(finalMessage) }
@@ -275,7 +282,8 @@ final class AppViewModel: ObservableObject {
             id: item.id ?? "\(turnID)-\(item.type)-\(fallbackIndex)",
             role: item.type == "userMessage" ? .user : .assistant,
             text: text,
-            createdAt: item.createdAt
+            createdAt: item.createdAt,
+            sourceTurnID: turnID
         )
     }
 
@@ -323,8 +331,11 @@ final class AppViewModel: ObservableObject {
         if let readTargets = readTargets(from: trimmed) {
             return ("Read \(joinedTargets(readTargets))", "read")
         }
-        if let searchTargets = searchTargets(from: trimmed) {
-            return ("Search \(joinedTargets(searchTargets))", "search")
+        if let search = searchDisplay(from: trimmed) {
+            return ("Search \(search.query) in \(joinedTargets(search.targets))", "search")
+        }
+        if activity == "approval" {
+            return (trimmed, "approval")
         }
         if activity == "edited" {
             return ("Edited \(editedDisplay(from: trimmed))", "edit")
@@ -332,7 +343,7 @@ final class AppViewModel: ObservableObject {
         if activity == "explored" {
             return ("Explored \(joinedTargets(fileTargets(from: trimmed), fallback: trimmed))", "explore")
         }
-        return ("\(status == "inProgress" ? "Running" : "Ran") \(trimmed)", "run")
+        return ("\(status == "inProgress" ? "Running" : "Ran") \(unwrappedShellCommand(trimmed))", "run")
     }
 
     private func editedDisplay(from command: String) -> String {
@@ -346,10 +357,103 @@ final class AppViewModel: ObservableObject {
         return targets.isEmpty ? ["files"] : targets
     }
 
-    private func searchTargets(from command: String) -> [String]? {
-        guard containsCommand(command, names: ["rg", "grep", "find", "fd"]) else { return nil }
-        let targets = fileTargets(from: command)
-        return targets.isEmpty ? ["workspace"] : targets
+    private func searchDisplay(from command: String) -> (query: String, targets: [String])? {
+        let searchCommands = Set(["rg", "grep", "find", "fd"])
+        let tokens = semanticCommandTokens(command)
+        guard let commandIndex = tokens.firstIndex(where: {
+            searchCommands.contains(($0 as NSString).lastPathComponent.lowercased())
+        }) else { return nil }
+
+        let commandName = (tokens[commandIndex] as NSString).lastPathComponent.lowercased()
+        let arguments = Array(tokens.dropFirst(commandIndex + 1))
+        var query: String?
+        var pathTokens: [String] = []
+
+        if commandName == "find" {
+            var index = 0
+            while index < arguments.count {
+                let token = arguments[index]
+                if ["-name", "-iname", "-path", "-ipath", "-regex", "-iregex"].contains(token),
+                   index + 1 < arguments.count {
+                    query = arguments[index + 1]
+                    index += 2
+                    continue
+                }
+                if !token.hasPrefix("-") && query == nil {
+                    pathTokens.append(token)
+                }
+                index += 1
+            }
+        } else {
+            let optionsWithValue = Set([
+                "-f", "--file", "-g", "--glob", "-t", "--type", "--type-add",
+                "-m", "--max-count", "-A", "-B", "-C", "--after-context",
+                "--before-context", "--context", "--encoding", "--engine"
+            ])
+            var index = 0
+            while index < arguments.count {
+                let token = arguments[index]
+                if ["-e", "--regexp"].contains(token), index + 1 < arguments.count {
+                    query = arguments[index + 1]
+                    index += 2
+                    continue
+                }
+                if optionsWithValue.contains(token) {
+                    index += min(2, arguments.count - index)
+                    continue
+                }
+                if token.hasPrefix("-") {
+                    index += 1
+                    continue
+                }
+                if query == nil {
+                    query = token
+                } else {
+                    pathTokens.append(token)
+                }
+                index += 1
+            }
+        }
+
+        let cleanedQuery = query?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let cleanedQuery, !cleanedQuery.isEmpty else { return nil }
+        let targets = displayTargets(from: pathTokens)
+        return (cleanedQuery, targets.isEmpty ? ["workspace"] : targets)
+    }
+
+    private func semanticCommandTokens(_ command: String) -> [String] {
+        let tokens = shellLikeTokens(command)
+        let shells = Set(["sh", "bash", "zsh", "fish"])
+        guard let first = tokens.first,
+              shells.contains((first as NSString).lastPathComponent.lowercased()),
+              let commandFlagIndex = tokens.firstIndex(where: { $0 == "-c" || $0 == "-lc" }),
+              commandFlagIndex + 1 < tokens.count else { return tokens }
+        return shellLikeTokens(tokens[commandFlagIndex + 1])
+    }
+
+    private func unwrappedShellCommand(_ command: String) -> String {
+        let tokens = shellLikeTokens(command)
+        let shells = Set(["sh", "bash", "zsh", "fish"])
+        guard let first = tokens.first,
+              shells.contains((first as NSString).lastPathComponent.lowercased()),
+              let commandFlagIndex = tokens.firstIndex(where: { $0 == "-c" || $0 == "-lc" }),
+              commandFlagIndex + 1 < tokens.count else { return command }
+        return tokens.dropFirst(commandFlagIndex + 1).joined(separator: " ")
+    }
+
+    private func displayTargets(from tokens: [String]) -> [String] {
+        tokens.reduce(into: [String]()) { result, token in
+            let cleaned = token.trimmingCharacters(in: CharacterSet(charactersIn: ","))
+            guard !cleaned.isEmpty else { return }
+            let display: String
+            if cleaned == "." || cleaned == "./" {
+                display = "workspace"
+            } else {
+                let name = (cleaned as NSString).lastPathComponent
+                display = name.isEmpty ? cleaned : name
+            }
+            if !result.contains(display) { result.append(display) }
+        }
     }
 
     private func containsCommand(_ command: String, names: [String]) -> Bool {
@@ -367,8 +471,8 @@ final class AppViewModel: ObservableObject {
     }
 
     private func fileTargets(from command: String) -> [String] {
-        let tokens = shellLikeTokens(command)
-        let ignoredCommands = Set(["sed", "cat", "head", "tail", "rg", "grep", "find", "fd", "git", "ps", "aux", "ls", "pwd", "wc", "stat", "which"])
+        let tokens = semanticCommandTokens(command)
+        let ignoredCommands = Set(["sed", "cat", "head", "tail", "rg", "grep", "find", "fd", "git", "ps", "aux", "ls", "pwd", "wc", "stat", "which", "sh", "bash", "zsh", "fish", "env"])
         let ignoredOptionArguments = Set(["-n", "-e", "-f", "-m", "-A", "-B", "-C", "--max-count", "--after-context", "--before-context", "--context", "--glob", "-g", "--type", "-t"])
         var values: [String] = []
         var skipNext = false
@@ -384,7 +488,8 @@ final class AppViewModel: ObservableObject {
             if token.hasPrefix("-") { continue }
             let bare = token.trimmingCharacters(in: CharacterSet(charactersIn: ","))
             if bare.isEmpty { continue }
-            if ignoredCommands.contains(bare.lowercased()) { continue }
+            let executableName = (bare as NSString).lastPathComponent.lowercased()
+            if ignoredCommands.contains(bare.lowercased()) || ignoredCommands.contains(executableName) { continue }
             if bare.range(of: #"^\d+,\d+p$"#, options: .regularExpression) != nil { continue }
             if bare.range(of: #"^\d+p$"#, options: .regularExpression) != nil { continue }
             if bare.contains("/") || bare.contains(".") {
@@ -449,25 +554,10 @@ final class AppViewModel: ObservableObject {
     }
 
     private func mergeSemanticExecutionItems(_ items: [ChatMessage]) -> [ChatMessage] {
-        var result: [ChatMessage] = []
-        var groupIndexes: [String: Int] = [:]
-        for item in items {
-            guard item.role == .execution,
-                  let kind = item.executionKind,
-                  ["read", "search"].contains(kind),
-                  let createdAt = item.createdAt else {
-                result.append(item)
-                continue
-            }
-            let key = "\(kind)-\(Int((createdAt * 10).rounded()))"
-            if let index = groupIndexes[key] {
-                result[index] = mergedExecutionItem(result[index], with: item, kind: kind)
-            } else {
-                groupIndexes[key] = result.count
-                result.append(item)
-            }
-        }
-        return result
+        // Preserve every fine-grained execution item. Time-bucket merging made
+        // rapid live Read/Search events collapse across intervening messages,
+        // which looked like missing commands and also changed their order.
+        items
     }
 
     private func mergedExecutionItem(_ first: ChatMessage, with second: ChatMessage, kind: String) -> ChatMessage {
@@ -508,25 +598,10 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func processSummaryText(_ items: [ChatMessage], totalCount: Int? = nil) -> String {
-        let read = items.filter { $0.role == .execution && $0.executionKind == "read" }.count
-        let search = items.filter { $0.role == .execution && $0.executionKind == "search" }.count
-        let explored = items.filter { $0.role == .execution && $0.executionKind == "explore" }.count
-        let edited = items.filter { $0.role == .execution && $0.executionKind == "edit" }.count
-        let ran = items.filter { $0.role == .execution && $0.executionKind == "run" }.count
-        let messages = items.filter { $0.role == .assistant }.count
-        let compressed = items.filter { $0.role == .compressed }.count
+    private func processSummaryText(_ items: [ChatMessage]) -> String {
         let taskSummary = items.last { $0.role == .taskSummary }?.text
-        var parts: [String] = []
-        if read > 0 { parts.append("Read \(read)") }
-        if search > 0 { parts.append("Search \(search)") }
-        if explored > 0 { parts.append("Explored \(explored)") }
-        if edited > 0 { parts.append("Edited \(edited)") }
-        if ran > 0 { parts.append("Ran \(ran)") }
-        if messages > 0 { parts.append("消息 \(messages)") }
-        if compressed > 0 { parts.append("Compressed \(compressed)") }
-        if let taskSummary, !taskSummary.isEmpty { parts.append(taskSummary) }
-        return "查看过程（\(totalCount ?? items.count)）" + (parts.isEmpty ? "" : " · \(parts.joined(separator: " · "))")
+        guard let taskSummary, !taskSummary.isEmpty else { return "查看过程" }
+        return "查看过程 · \(taskSummary)"
     }
 
     private func shouldHidePersistedLiveMessage(_ item: TurnItem, turnID: String) -> Bool {
@@ -535,7 +610,7 @@ final class AppViewModel: ObservableObject {
         let persisted = normalizedMessageText(item.renderedText)
         guard !persisted.isEmpty else { return false }
         return liveMessages.contains { message in
-            guard liveMessageTurnIDs[message.id] == nil || liveMessageTurnIDs[message.id] == turnID else { return false }
+            guard liveMessageTurnIDs[message.id] == turnID else { return false }
             let streaming = normalizedMessageText(message.text)
             return !streaming.isEmpty && (streaming == persisted || streaming.hasPrefix(persisted))
         }
@@ -546,52 +621,200 @@ final class AppViewModel: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func beginLiveMessage(id: String, turnID: String?, text: String = "", createdAt: Double? = nil) {
+    private func nextLiveCreatedAt() -> Double {
+        liveOrderingClock = max(Date().timeIntervalSince1970, liveOrderingClock + 0.000_001)
+        return liveOrderingClock
+    }
+
+    private func liveTurnID(
+        from params: [String: Any],
+        item: [String: Any]? = nil,
+        threadID: String
+    ) -> String? {
+        params["turnId"] as? String
+            ?? (params["turn"] as? [String: Any])?["id"] as? String
+            ?? item?["turnId"] as? String
+            ?? activeTurnNotificationKeys[threadID]
+    }
+
+    private func liveText(from item: [String: Any]?) -> String {
+        guard let item else { return "" }
+        if let text = item["text"] as? String, !text.isEmpty { return text }
+        if let message = item["message"] as? String, !message.isEmpty { return message }
+        guard let content = item["content"] as? [[String: Any]] else { return "" }
+        return content.compactMap { part in
+            part["text"] as? String ?? part["value"] as? String
+        }.joined()
+    }
+
+    private func isCompactionSummary(_ text: String) -> Bool {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.range(
+            of: #"^(?:#+\s*|\*\*)?handoff summary\b"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+    }
+
+    private func isCompactionItem(_ item: [String: Any]) -> Bool {
+        let type = (item["type"] as? String ?? "").lowercased()
+        return type.contains("compact") || type.contains("compress")
+    }
+
+    private func recordLiveCompaction(turnID: String?) {
+        liveMessages.removeAll { message in
+            guard message.role == .assistant, isCompactionSummary(message.text) else { return false }
+            suppressedCompactionMessageIDs.insert(message.id)
+            liveMessageTurnIDs.removeValue(forKey: message.id)
+            return true
+        }
+        guard let turnID else { return }
+        let id = "\(turnID)-live-compacted"
+        guard !liveMessages.contains(where: { $0.id == id }) else { return }
+        liveMessageTurnIDs[id] = turnID
+        liveMessages.append(ChatMessage(
+            id: id,
+            role: .compressed,
+            text: "上下文已压缩",
+            createdAt: nextLiveCreatedAt(),
+            isCompressed: true
+        ))
+    }
+
+    private func beginLiveMessage(id: String, turnID: String?, text: String = "") {
+        if isCompactionSummary(text) {
+            suppressedCompactionMessageIDs.insert(id)
+            liveMessages.removeAll { $0.id == id }
+            liveMessageTurnIDs.removeValue(forKey: id)
+            return
+        }
+        guard !suppressedCompactionMessageIDs.contains(id) else { return }
         liveMessageTurnIDs[id] = turnID
         if let index = liveMessages.firstIndex(where: { $0.id == id }) {
             let previous = liveMessages[index]
-            liveMessages[index] = ChatMessage(id: id, role: .assistant, text: text, createdAt: createdAt ?? previous.createdAt)
+            liveMessages[index] = ChatMessage(id: id, role: .assistant, text: text, createdAt: previous.createdAt, sourceTurnID: turnID)
         } else {
-            liveMessages.append(ChatMessage(id: id, role: .assistant, text: text, createdAt: createdAt ?? Date().timeIntervalSince1970))
+            liveMessages.append(ChatMessage(id: id, role: .assistant, text: text, createdAt: nextLiveCreatedAt(), sourceTurnID: turnID))
         }
     }
 
     private func appendLiveDelta(id: String, turnID: String?, delta: String) {
+        guard !suppressedCompactionMessageIDs.contains(id) else { return }
+        let combinedText = (liveMessages.first(where: { $0.id == id })?.text ?? "") + delta
+        if isCompactionSummary(combinedText) {
+            suppressedCompactionMessageIDs.insert(id)
+            liveMessages.removeAll { $0.id == id }
+            liveMessageTurnIDs.removeValue(forKey: id)
+            return
+        }
         liveMessageTurnIDs[id] = turnID
         if let index = liveMessages.firstIndex(where: { $0.id == id }) {
             let previous = liveMessages[index]
-            liveMessages[index] = ChatMessage(id: id, role: .assistant, text: previous.text + delta, createdAt: previous.createdAt)
+            liveMessages[index] = ChatMessage(id: id, role: .assistant, text: previous.text + delta, createdAt: previous.createdAt, sourceTurnID: turnID)
         } else {
-            liveMessages.append(ChatMessage(id: id, role: .assistant, text: delta, createdAt: Date().timeIntervalSince1970))
+            liveMessages.append(ChatMessage(id: id, role: .assistant, text: delta, createdAt: nextLiveCreatedAt(), sourceTurnID: turnID))
         }
     }
 
-    private func upsertLiveExecution(item: [String: Any], turnID: String?, status: String) {
-        guard let id = item["id"] as? String else { return }
+    private func liveEditDiff(from item: [String: Any]) -> [EditDiffPayload]? {
+        if let existing = item["diff"] as? [[String: Any]] {
+            let decoded = existing.compactMap { payload -> EditDiffPayload? in
+                guard let name = payload["name"] as? String else { return nil }
+                let lines = (payload["lines"] as? [[String: Any]] ?? []).compactMap { line -> EditDiffLinePayload? in
+                    guard let kind = line["kind"] as? String,
+                          let text = line["text"] as? String else { return nil }
+                    return EditDiffLinePayload(kind: kind, text: text, lineNumber: (line["lineNumber"] as? NSNumber)?.intValue)
+                }
+                return EditDiffPayload(
+                    name: name,
+                    additions: (payload["additions"] as? NSNumber)?.intValue,
+                    deletions: (payload["deletions"] as? NSNumber)?.intValue,
+                    lines: lines.isEmpty ? nil : lines
+                )
+            }
+            if !decoded.isEmpty { return decoded }
+        }
+        guard let changes = item["changes"] as? [[String: Any]] else { return nil }
+        let payloads = changes.compactMap { change -> EditDiffPayload? in
+            guard let name = change["path"] as? String ?? change["filePath"] as? String,
+                  let diff = change["diff"] as? String,
+                  !diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            var oldLine = 1
+            var newLine = 1
+            var additions = 0
+            var deletions = 0
+            var lines: [EditDiffLinePayload] = []
+            for raw in diff.replacingOccurrences(of: "\r\n", with: "\n").split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
+                if raw.hasPrefix("@@") {
+                    lines.append(EditDiffLinePayload(kind: "header", text: raw.trimmingCharacters(in: .whitespaces), lineNumber: nil))
+                    let ranges = raw.split(whereSeparator: { $0.isWhitespace })
+                    if ranges.count >= 3 {
+                        oldLine = Int(ranges[1].dropFirst().split(separator: ",").first ?? "1") ?? oldLine
+                        newLine = Int(ranges[2].dropFirst().split(separator: ",").first ?? "1") ?? newLine
+                    }
+                    continue
+                }
+                if raw.hasPrefix("+++") || raw.hasPrefix("---") { continue }
+                if raw.hasPrefix("+") {
+                    lines.append(EditDiffLinePayload(kind: "addition", text: String(raw.dropFirst()), lineNumber: newLine))
+                    additions += 1
+                    newLine += 1
+                } else if raw.hasPrefix("-") {
+                    lines.append(EditDiffLinePayload(kind: "deletion", text: String(raw.dropFirst()), lineNumber: oldLine))
+                    deletions += 1
+                    oldLine += 1
+                } else if raw.hasPrefix(" ") {
+                    lines.append(EditDiffLinePayload(kind: "context", text: String(raw.dropFirst()), lineNumber: newLine))
+                    oldLine += 1
+                    newLine += 1
+                }
+            }
+            return EditDiffPayload(name: name, additions: additions, deletions: deletions, lines: lines)
+        }
+        return payloads.isEmpty ? nil : payloads
+    }
+
+    private func upsertLiveExecution(
+        item: [String: Any],
+        fallbackID: String? = nil,
+        turnID: String?,
+        status: String
+    ) {
+        guard let id = item["id"] as? String ?? fallbackID else { return }
+        let type = (item["type"] as? String ?? "").lowercased()
         let activity = item["activity"] as? String
+            ?? (type.contains("filechange") ? "edited" : nil)
+        let changedPaths = (item["changes"] as? [[String: Any]] ?? []).compactMap { change in
+            change["path"] as? String ?? change["filePath"] as? String
+        }
+        let existingIndex = liveMessages.firstIndex(where: { $0.id == id })
+        let previous = existingIndex.map { liveMessages[$0] }
+        let editDiff = activity == "edited" ? liveEditDiff(from: item) : nil
         // Codex uses different payload shapes for shell exploration and file
         // edits. Edits may not have a command at all, so do not discard them.
-        let command = (item["command"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawCommand = (item["command"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             ?? (item["path"] as? String)
-            ?? (activity == "edited" ? "files" : activity == "explored" ? "workspace" : "tool")
-        let execution = semanticExecution(command: command, activity: activity, status: status)
+            ?? (!changedPaths.isEmpty ? changedPaths.joined(separator: ", ") : nil)
+        let execution = rawCommand.map { semanticExecution(command: $0, activity: activity, status: status) }
         let duration: String? = {
             guard let milliseconds = (item["durationMs"] as? NSNumber)?.doubleValue else { return nil }
             return DateFormatting.duration(fromMilliseconds: milliseconds)
         }()
-        let createdAt = ((item["startedAtMs"] as? NSNumber)?.doubleValue ?? Date().timeIntervalSince1970 * 1000) / 1000
+        let createdAt = existingIndex.flatMap { liveMessages[$0].createdAt } ?? nextLiveCreatedAt()
         let message = ChatMessage(
             id: id,
             role: .execution,
-            text: execution.text,
+            text: execution?.text
+                ?? previous?.text
+                ?? (activity == "edited" ? "Edited files" : activity == "explored" ? "Explored workspace" : "Ran tool"),
             executionStatus: status,
-            executionDuration: duration,
-            executionExitCode: (item["exitCode"] as? NSNumber)?.intValue,
-            executionKind: execution.kind,
+            executionDuration: duration ?? previous?.executionDuration,
+            executionExitCode: (item["exitCode"] as? NSNumber)?.intValue ?? previous?.executionExitCode,
+            executionKind: execution?.kind ?? previous?.executionKind ?? (activity == "edited" ? "edit" : "run"),
+            editDiff: editDiff ?? previous?.editDiff,
             createdAt: createdAt
         )
         liveMessageTurnIDs[id] = turnID
-        if let index = liveMessages.firstIndex(where: { $0.id == id }) {
+        if let index = existingIndex {
             liveMessages[index] = message
         } else {
             liveMessages.append(message)
@@ -612,6 +835,8 @@ final class AppViewModel: ObservableObject {
     private func clearLiveMessages() {
         liveMessages = []
         liveMessageTurnIDs = [:]
+        suppressedCompactionMessageIDs = []
+        liveOrderingClock = 0
     }
 
     private func removePersistedLiveMessages(from result: ThreadDetail) {
@@ -644,6 +869,26 @@ final class AppViewModel: ObservableObject {
         await refresh()
         streamsStarted = true
         connectGlobalStream()
+    }
+
+    func resumeFromForeground() async {
+        guard started else { return }
+        await refresh()
+        guard let threadID = selectedThreadID else { return }
+        guard active else {
+            // Completed conversations are immutable from the chat viewport's
+            // perspective; avoid replacing their snapshot on foregrounding.
+            threadSSE.stop()
+            pollTask?.cancel()
+            pollTask = nil
+            return
+        }
+        // URLSession can be suspended while the app is in the background.
+        // Restore an authoritative active-turn snapshot before replaying live
+        // events so missed commands and intermediate messages are not lost.
+        await loadThread(threadID, force: true)
+        connectThreadStream(threadID: threadID)
+        startPolling(threadID: threadID)
     }
 
     func applySettings(
@@ -760,7 +1005,6 @@ final class AppViewModel: ObservableObject {
                     selectedModelID = visibleModels.first(where: { $0.isDefault == true })?.identifier
                         ?? visibleModels.first?.identifier
                         ?? ""
-                    UserDefaults.standard.set(selectedModelID, forKey: "cloudex.model")
                 }
                 normalizeEffortForSelectedModel()
                 return
@@ -837,6 +1081,9 @@ final class AppViewModel: ObservableObject {
         localError = nil
         attachedFiles = []
         detail = ThreadDetail(thread: thread, turns: [])
+        if let model = thread.model?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
+            selectedModelID = model
+        }
         liveRunning = thread.isActive
         messageIndex = []
         let cache = conversationCache
@@ -846,6 +1093,9 @@ final class AppViewModel: ObservableObject {
         guard selectedThreadID == thread.id else { return }
         if let cachedDetail {
             detail = cachedDetail
+            if let model = cachedDetail.thread.model?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
+                selectedModelID = model
+            }
             liveRunning = cachedDetail.thread.isActive
         }
         let cachedIndex = await Task.detached(priority: .utility) {
@@ -855,7 +1105,12 @@ final class AppViewModel: ObservableObject {
         if let cachedIndex { messageIndex = cachedIndex }
         await loadThread(thread.id, force: true, replacingHistory: true)
         connectThreadStream(threadID: thread.id)
-        startPolling(threadID: thread.id)
+        if liveRunning {
+            startPolling(threadID: thread.id)
+        } else {
+            pollTask?.cancel()
+            pollTask = nil
+        }
     }
 
     func startNewChat(projectCWD: String? = nil) {
@@ -880,7 +1135,10 @@ final class AppViewModel: ObservableObject {
         do {
             let result: ThreadDetail = try await client.get(
                 client.threadPath(threadID),
-                queryItems: [URLQueryItem(name: "view", value: "compact")]
+                // Load the complete timeline before the first layout pass.
+                // Expanding a process row must not trigger a second response
+                // that changes the scrollable content height.
+                queryItems: []
             )
             guard selectedThreadID == threadID, generation == detailLoadGeneration else { return }
             let updatedDetail = replacingHistory ? result : mergingLatestPage(result, into: detail)
@@ -910,7 +1168,7 @@ final class AppViewModel: ObservableObject {
         guard let threadID = selectedThreadID,
               let current = detail,
               let index = current.turns.firstIndex(where: { $0.id == turnID }) else { return false }
-        if current.turns[index].detailsLoaded == true { return true }
+        if current.turns[index].processDetailsAreLoaded { return true }
         do {
             let result: TurnDetailResponse = try await client.get(client.threadTurnPath(threadID, turnID: turnID))
             guard selectedThreadID == threadID, let latest = detail,
@@ -934,7 +1192,16 @@ final class AppViewModel: ObservableObject {
         guard let current, !current.turns.isEmpty else { return latest }
         let currentByID = Dictionary(uniqueKeysWithValues: current.turns.map { ($0.id, $0) })
         let turns = latest.turns.map { compactTurn in
-            guard let existing = currentByID[compactTurn.id], existing.detailsLoaded == true else { return compactTurn }
+            guard let existing = currentByID[compactTurn.id], existing.processDetailsAreLoaded else { return compactTurn }
+            // Active compact responses intentionally contain the complete,
+            // growing timeline and are marked detailsLoaded. Reusing the
+            // first loaded object here would discard every later desktop
+            // polling snapshot until the conversation is reopened.
+            if isTurnInProgress(compactTurn) || isTurnInProgress(existing) {
+                return compactTurn
+            }
+            // Preserve an explicitly loaded full timeline only after the turn
+            // is stable; completed compact snapshots omit process details.
             return existing
         }
         return ThreadDetail(
@@ -1013,6 +1280,73 @@ final class AppViewModel: ObservableObject {
         isBusy = false
     }
 
+    func forkAssistantMessage(_ message: ChatMessage) async -> Bool {
+        guard let threadID = selectedThreadID,
+              let turnID = message.sourceTurnID else {
+            status = "无法确定这条回复所属的对话轮次"
+            return false
+        }
+        return await forkThread(
+            threadID: threadID,
+            turnID: turnID,
+            position: "through",
+            editedMessage: nil
+        )
+    }
+
+    func editUserMessage(_ message: ChatMessage, replacement: String) async -> Bool {
+        guard let threadID = selectedThreadID,
+              let turnID = message.sourceTurnID else {
+            status = "无法确定这条消息所属的对话轮次"
+            return false
+        }
+        let trimmed = replacement.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return await forkThread(
+            threadID: threadID,
+            turnID: turnID,
+            position: "before",
+            editedMessage: trimmed
+        )
+    }
+
+    private func forkThread(
+        threadID: String,
+        turnID: String,
+        position: String,
+        editedMessage: String?
+    ) async -> Bool {
+        isBusy = true
+        defer { isBusy = false }
+        var payload: [String: Any] = [
+            "turnId": turnID,
+            "position": position,
+        ]
+        if let editedMessage { payload["message"] = editedMessage }
+        if !selectedModelID.isEmpty { payload["model"] = selectedModelID }
+        if !selectedEffortID.isEmpty { payload["effort"] = selectedEffortID }
+        do {
+            let result: ForkThreadResponse = try await client.post(
+                client.threadPath(threadID, action: "fork"),
+                json: payload
+            )
+            clearMessageJumpRequest()
+            let projectCWD = selectedProjectCWD
+            await openThread(result.thread, projectCWD: projectCWD)
+            threadNavigationRequest = ThreadNavigationRequest(threadID: result.thread.id)
+            await refresh()
+            status = editedMessage == nil ? "已分叉对话" : "已从修改后的消息继续对话"
+            return true
+        } catch {
+            status = "分叉对话失败：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func clearThreadNavigationRequest() {
+        threadNavigationRequest = nil
+    }
+
     func stop() async {
         guard let selectedThreadID else { return }
         isBusy = true
@@ -1041,6 +1375,42 @@ final class AppViewModel: ObservableObject {
 
     func listFiles(path: String) async throws -> RemoteFilesResponse {
         try await client.get("/api/files", queryItems: [URLQueryItem(name: "path", value: path)])
+    }
+
+    func previewFile(path: String) async throws -> Data {
+        try await client.download("/api/file", queryItems: [URLQueryItem(name: "path", value: path)])
+    }
+
+    func searchConversationMessages(_ query: String) async -> [ConversationSearchMatch] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        for candidate in connectionCandidates {
+            do {
+                let candidateClient = APIClient(serverURL: candidate, token: authToken)
+                let response: ConversationSearchResponse = try await candidateClient.get(
+                    "/api/search/messages",
+                    queryItems: [URLQueryItem(name: "q", value: trimmed)]
+                )
+                if normalizedURL(serverURL) != candidate { serverURL = candidate }
+                return response.data
+            } catch {
+                continue
+            }
+        }
+        return []
+    }
+
+    func requestMessageJump(threadID: String, messageID: String, turnID: String, query: String) {
+        pendingMessageJump = PendingMessageJump(
+            threadID: threadID,
+            messageID: messageID,
+            turnID: turnID,
+            query: query
+        )
+    }
+
+    func clearMessageJumpRequest() {
+        pendingMessageJump = nil
     }
 
     func attach(_ file: RemoteFileEntry) {
@@ -1186,34 +1556,62 @@ final class AppViewModel: ObservableObject {
             return
         }
         if event.name == "approval/resolved",
-           let object = (try? JSONSerialization.jsonObject(with: event.data)) as? [String: Any],
-           let id = object["id"] as? String {
-            let approval = pendingApprovals.first { $0.id == id }
-            let threadID = object["threadId"] as? String ?? approval?.threadId
-            if let rawDecision = object["decision"] as? String,
+           let resolved = try? JSONDecoder().decode(ApprovalResolvedEvent.self, from: event.data) {
+            let approval = resolved.approval ?? pendingApprovals.first { $0.id == resolved.id }
+            let threadID = resolved.threadId ?? approval?.threadId
+            if let rawDecision = resolved.decision,
                let decision = ApprovalDecision(rawValue: rawDecision) {
-                appendApprovalSystemMessage(
-                    approvalID: id,
-                    threadID: threadID,
-                    decision: decision,
-                    requestedAt: approval?.requestedAt
-                )
+                if let approval {
+                    appendApprovalSystemMessage(approval: approval, decision: decision)
+                } else {
+                    appendApprovalSystemMessage(
+                        approvalID: resolved.id,
+                        threadID: threadID,
+                        decision: decision,
+                        requestedAt: nil
+                    )
+                }
             }
-            pendingApprovals.removeAll { $0.id == id }
-            CloudexAppDelegate.notifications.removeApproval(id)
+            pendingApprovals.removeAll { $0.id == resolved.id }
+            CloudexAppDelegate.notifications.removeApproval(resolved.id)
             return
         }
         if event.name == "threads/changed",
            let snapshot = try? JSONDecoder().decode(ProjectSnapshot.self, from: event.data) {
             applyProjects(snapshot.projects)
             if let selectedThreadID,
-               snapshot.projects.flatMap(\.threads).contains(where: { $0.id == selectedThreadID }) {
+               snapshot.projects.flatMap(\.threads).contains(where: { $0.id == selectedThreadID }),
+               active {
                 Task { await loadThread(selectedThreadID, force: true) }
             }
         }
     }
 
     private func appendApprovalSystemMessage(approval: ApprovalRequest, decision: ApprovalDecision) {
+        let turnID = approval.turnId
+            ?? approval.threadId.flatMap { activeTurnNotificationKeys[$0] }
+        if approval.threadId == selectedThreadID, let turnID {
+            let id = "approval-\(approval.id)-\(decision.rawValue)"
+            let existingIndex = liveMessages.firstIndex { $0.id == id }
+            let createdAt = existingIndex.flatMap { liveMessages[$0].createdAt } ?? nextLiveCreatedAt()
+            let message = ChatMessage(
+                id: id,
+                role: .execution,
+                text: approvalConfirmationText(approval: approval, decision: decision),
+                executionStatus: decision == .decline ? "declined" : "completed",
+                executionKind: "approval",
+                createdAt: createdAt,
+                threadID: approval.threadId
+            )
+            liveMessageTurnIDs[id] = turnID
+            systemMessages.removeAll { $0.id == id }
+            if let existingIndex {
+                liveMessages[existingIndex] = message
+            } else {
+                liveMessages.append(message)
+            }
+            return
+        }
         appendApprovalSystemMessage(
             approvalID: approval.id,
             threadID: approval.threadId,
@@ -1245,13 +1643,18 @@ final class AppViewModel: ObservableObject {
 
     private func approvalConfirmationText(approval: ApprovalRequest, decision: ApprovalDecision) -> String {
         var details: [String] = []
+        if let reason = approval.reason?.trimmingCharacters(in: .whitespacesAndNewlines), !reason.isEmpty {
+            details.append("说明：\(reason)")
+        }
         if let context = approval.networkApprovalContext, let host = context.host, !host.isEmpty {
             let scheme = context.protocolName.map { "\($0)://" } ?? ""
             let port = context.port.map { ":\($0)" } ?? ""
             details.append("网络：\(scheme)\(host)\(port)")
-        } else if let permissionSummary = approval.permissionSummary, !permissionSummary.isEmpty {
+        }
+        if let permissionSummary = approval.permissionSummary, !permissionSummary.isEmpty {
             details.append("权限：\(permissionSummary)")
-        } else if let command = approval.command, !command.isEmpty {
+        }
+        if let command = approval.command, !command.isEmpty {
             details.append("命令：\(command)")
         }
         if let path = approval.grantRoot ?? approval.cwd, !path.isEmpty {
@@ -1291,51 +1694,68 @@ final class AppViewModel: ObservableObject {
             let turnID = params["turnId"] as? String
                 ?? (params["turn"] as? [String: Any])?["id"] as? String
                 ?? UUID().uuidString
+            let previousTurnID = activeTurnNotificationKeys[expectedThreadID]
             activeTurnNotificationKeys[expectedThreadID] = turnID
-            clearLiveMessages()
+            // Compaction resumes the same logical turn and can emit another
+            // turn/started. Preserve everything already shown for that turn.
+            if previousTurnID != turnID { clearLiveMessages() }
             localError = nil
         } else if method == "item/started" {
             let item = params["item"] as? [String: Any]
+            let turnID = liveTurnID(from: params, item: item, threadID: expectedThreadID)
+            if let item, isCompactionItem(item) {
+                recordLiveCompaction(turnID: turnID)
+                return
+            }
             if let item, isLiveExecutionItem(item) {
-                upsertLiveExecution(item: item, turnID: params["turnId"] as? String, status: "inProgress")
+                upsertLiveExecution(
+                    item: item,
+                    fallbackID: params["itemId"] as? String,
+                    turnID: turnID,
+                    status: "inProgress"
+                )
                 liveRunning = true
                 return
             }
             guard item?["type"] as? String == "agentMessage" else { return }
             liveRunning = true
             guard let itemID = item?["id"] as? String else { return }
-            let startedAt = (params["startedAtMs"] as? NSNumber)?.doubleValue
             beginLiveMessage(
                 id: itemID,
-                turnID: params["turnId"] as? String,
-                text: item?["text"] as? String ?? "",
-                createdAt: startedAt.map { $0 / 1000 }
+                turnID: turnID,
+                text: liveText(from: item)
             )
         } else if method == "item/agentMessage/delta" {
             liveRunning = true
             guard let itemID = params["itemId"] as? String else { return }
-            appendLiveDelta(id: itemID, turnID: params["turnId"] as? String, delta: params["delta"] as? String ?? "")
+            appendLiveDelta(
+                id: itemID,
+                turnID: liveTurnID(from: params, threadID: expectedThreadID),
+                delta: params["delta"] as? String ?? ""
+            )
         } else if method == "item/completed" || method == "item/updated" {
             let item = params["item"] as? [String: Any]
+            let turnID = liveTurnID(from: params, item: item, threadID: expectedThreadID)
+            if let item, isCompactionItem(item) {
+                recordLiveCompaction(turnID: turnID)
+                return
+            }
             if let item, isLiveExecutionItem(item) {
                 upsertLiveExecution(
                     item: item,
-                    turnID: params["turnId"] as? String,
+                    fallbackID: params["itemId"] as? String,
+                    turnID: turnID,
                     status: item["status"] as? String ?? "completed"
                 )
                 return
             }
             guard item?["type"] as? String == "agentMessage" else { return }
-            if let completedID = item?["id"] as? String,
-               let text = item?["text"] as? String,
-               !text.isEmpty {
-                beginLiveMessage(id: completedID, turnID: params["turnId"] as? String, text: text)
+            let text = liveText(from: item)
+            if let completedID = item?["id"] as? String, !text.isEmpty {
+                beginLiveMessage(id: completedID, turnID: turnID, text: text)
             }
-            Task { [weak self] in
-                try? await Task.sleep(for: .milliseconds(80))
-                guard let self else { return }
-                await self.loadThread(expectedThreadID, force: true)
-            }
+        } else if method.lowercased().contains("compact") || method.lowercased().contains("compress") {
+            recordLiveCompaction(turnID: liveTurnID(from: params, threadID: expectedThreadID))
         } else if ["turn/failed", "turn/interrupted", "turn/cancelled", "turn/canceled"].contains(method) {
             liveRunning = false
             if let errorText = notificationErrorText(params) {
@@ -1345,7 +1765,7 @@ final class AppViewModel: ObservableObject {
             } else {
                 notifyTaskResultOnce(threadID: expectedThreadID, params: params, success: false)
             }
-            reloadAfterEvent(expectedThreadID)
+            reloadAfterEvent(expectedThreadID, waitForTerminalSnapshot: true)
         } else if method == "turn/completed" {
             liveRunning = false
             if let errorText = notificationErrorText(params) {
@@ -1356,7 +1776,7 @@ final class AppViewModel: ObservableObject {
                 localError = nil
                 notifyTaskResultOnce(threadID: expectedThreadID, params: params, success: true)
             }
-            reloadAfterEvent(expectedThreadID)
+            reloadAfterEvent(expectedThreadID, waitForTerminalSnapshot: true)
         } else if method == "thread/archived" || method == "thread/name/updated" {
             reloadAfterEvent(expectedThreadID)
         }
@@ -1394,13 +1814,31 @@ final class AppViewModel: ObservableObject {
         )
     }
 
-    private func reloadAfterEvent(_ threadID: String) {
+    private func reloadAfterEvent(_ threadID: String, waitForTerminalSnapshot: Bool = false) {
         Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(250))
+            let delays: [Duration] = waitForTerminalSnapshot
+                ? [.milliseconds(250), .milliseconds(500), .seconds(1), .seconds(2)]
+                : [.milliseconds(250)]
+            for delay in delays {
+                try? await Task.sleep(for: delay)
+                guard let self, self.selectedThreadID == threadID else { return }
+                await self.loadThread(threadID, force: true)
+                if !waitForTerminalSnapshot || self.hasTerminalSnapshot(for: threadID) {
+                    break
+                }
+            }
             guard let self else { return }
-            await self.loadThread(threadID, force: true)
             await self.refresh()
         }
+    }
+
+    private func hasTerminalSnapshot(for threadID: String) -> Bool {
+        guard selectedThreadID == threadID,
+              !liveRunning,
+              selectedThread?.isActive != true,
+              let lastTurn = detail?.turns.last,
+              lastTurn.status != nil else { return false }
+        return !isTurnInProgress(lastTurn)
     }
 
     private func startPolling(threadID: String) {
@@ -1409,11 +1847,13 @@ final class AppViewModel: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))
                 guard let self, self.selectedThreadID == threadID else { return }
-                // SSE owns all live task updates. Replacing the complete
-                // thread snapshot every two seconds makes long LazyVStacks
-                // recalculate row heights and shifts the user's viewport.
-                // The completion event performs one final forced reload.
-                await self.loadThread(threadID)
+                guard self.active else { return }
+                // Desktop-started turns can update the persisted session
+                // without emitting notifications on this app-server stream.
+                // Keep the selected conversation current with a snapshot
+                // fallback. ContentView merges these rows without issuing a
+                // scroll request when the user is not following the bottom.
+                await self.loadThread(threadID, force: true)
             }
         }
     }

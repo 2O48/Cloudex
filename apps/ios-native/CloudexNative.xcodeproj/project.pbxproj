@@ -18,6 +18,8 @@
 		A00000000000000000000009 /* RemoteFilePickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000009 /* RemoteFilePickerView.swift */; };
 		A0000000000000000000000A /* LocalConversationCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000C /* LocalConversationCache.swift */; };
 		A0000000000000000000000B /* gitdiff in Frameworks */ = {isa = PBXBuildFile; productRef = H00000000000000000000002 /* gitdiff */; };
+		A0000000000000000000000C /* WorkspaceTabsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000D /* WorkspaceTabsView.swift */; };
+		A0000000000000000000000D /* CodePreviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000E /* CodePreviewView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -31,6 +33,8 @@
 		B00000000000000000000008 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		B00000000000000000000009 /* RemoteFilePickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteFilePickerView.swift; sourceTree = "<group>"; };
 		B0000000000000000000000C /* LocalConversationCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalConversationCache.swift; sourceTree = "<group>"; };
+		B0000000000000000000000D /* WorkspaceTabsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceTabsView.swift; sourceTree = "<group>"; };
+		B0000000000000000000000E /* CodePreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodePreviewView.swift; sourceTree = "<group>"; };
 		B0000000000000000000000A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B0000000000000000000000B /* CloudexNative.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CloudexNative.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -68,6 +72,8 @@
 				B00000000000000000000008 /* SettingsView.swift */,
 				B00000000000000000000009 /* RemoteFilePickerView.swift */,
 				B0000000000000000000000C /* LocalConversationCache.swift */,
+				B0000000000000000000000D /* WorkspaceTabsView.swift */,
+				B0000000000000000000000E /* CodePreviewView.swift */,
 				B0000000000000000000000A /* Info.plist */,
 			);
 			path = CloudexNative;
@@ -166,6 +172,8 @@
 				A00000000000000000000008 /* SettingsView.swift in Sources */,
 				A00000000000000000000009 /* RemoteFilePickerView.swift in Sources */,
 				A0000000000000000000000A /* LocalConversationCache.swift in Sources */,
+				A0000000000000000000000C /* WorkspaceTabsView.swift in Sources */,
+				A0000000000000000000000D /* CodePreviewView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

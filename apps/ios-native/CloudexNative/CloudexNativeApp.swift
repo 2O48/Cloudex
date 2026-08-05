@@ -17,7 +17,9 @@ struct CloudexNativeApp: App {
                 }
                 .onChange(of: scenePhase) { _, phase in
                     CloudexAppDelegate.notifications.setAppIsInForeground(phase == .active)
-                    if phase != .active {
+                    if phase == .active {
+                        Task { await viewModel.resumeFromForeground() }
+                    } else {
                         for approval in viewModel.pendingApprovals {
                             CloudexAppDelegate.notifications.scheduleApproval(approval)
                         }

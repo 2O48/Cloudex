@@ -47,6 +47,24 @@ final class LocalConversationCache {
     private func compactDetail(_ detail: ThreadDetail) -> ThreadDetail {
         let turns = detail.turns.map { turn in
             let items = turn.items ?? []
+            // Running turns must remain lossless across app suspension or a
+            // cold relaunch. There is no final assistant item yet, so reducing
+            // them to a compact snapshot would retain only the latest bubble.
+            if turn.status == "inProgress" {
+                return CloudexTurn(
+                    id: turn.id,
+                    items: items,
+                    status: turn.status,
+                    error: turn.error,
+                    startedAt: turn.startedAt,
+                    completedAt: turn.completedAt,
+                    durationMs: turn.durationMs,
+                    compressed: turn.compressed,
+                    itemsView: "full",
+                    processItemCount: 0,
+                    detailsLoaded: true
+                )
+            }
             let finalAgentIndex = items.lastIndex { $0.type == "agentMessage" && $0.phase == "final_answer" }
                 ?? items.lastIndex { $0.type == "agentMessage" }
             let visibleItems = items.enumerated().compactMap { index, item in

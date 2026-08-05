@@ -67,7 +67,8 @@ function commandResult(output) {
 }
 
 function jsStringProperty(source, property) {
-  const match = String(source || "").match(new RegExp(`\\b${property}\\s*:\\s*("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`));
+  const escapedProperty = property.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = String(source || "").match(new RegExp(`(?:^|[,{\\s])['\"]?${escapedProperty}['\"]?\\s*:\\s*("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`));
   if (!match) return null;
   const literal = match[1];
   if (literal.startsWith('"')) {
@@ -82,7 +83,8 @@ function jsStringProperty(source, property) {
 }
 
 function jsNumberProperty(source, property) {
-  const match = String(source || "").match(new RegExp(`\\b${property}\\s*:\\s*(\\d+)`));
+  const escapedProperty = property.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = String(source || "").match(new RegExp(`(?:^|[,{\\s])['\"]?${escapedProperty}['\"]?\\s*:\\s*(\\d+)`));
   return match ? Number(match[1]) : null;
 }
 
@@ -327,6 +329,27 @@ function addUniqueItem(turn, item) {
   turn.items.push(item);
 }
 
+function removeCompactionSummary(state, compactionMessage) {
+  const wrapper = String(compactionMessage || "");
+  for (let turnIndex = state.turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+    const turn = state.turns[turnIndex];
+    for (let itemIndex = turn.items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+      const item = turn.items[itemIndex];
+      if (item.type !== "agentMessage") continue;
+      const text = itemPlainText(item).trim();
+      if (!text) continue;
+      const normalized = text.replace(/^\s+/, "");
+      const looksLikeHandoff = /^(?:#+\s*|\*\*)?handoff summary\b/i.test(normalized);
+      if (!looksLikeHandoff && !wrapper.includes(text)) continue;
+      turn.items.splice(itemIndex, 1);
+      turn.compressed = true;
+      return;
+    }
+  }
+  const currentTurn = state.currentTurnId ? state.turnMap.get(state.currentTurnId) : null;
+  if (currentTurn) currentTurn.compressed = true;
+}
+
 function previewFromTurns(turns) {
   for (const turn of turns) {
     for (const item of turn.items || []) {
@@ -395,6 +418,13 @@ function parseSessionLine(state, record) {
   }
 
   const payload = record.payload || {};
+  if (record.type === "compacted") {
+    // Codex writes its internal handoff summary as an assistant final_answer
+    // immediately before the compaction record. It is model context, not a
+    // user-facing reply, so remove it while keeping every earlier turn/item.
+    removeCompactionSummary(state, payload.message);
+    return;
+  }
   if (record.type === "session_meta") {
     state.sessionId = payload.session_id || payload.id || state.sessionId || state.id;
     state.cwd = payload.cwd || state.cwd;

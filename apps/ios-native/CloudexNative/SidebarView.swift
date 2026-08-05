@@ -4,68 +4,57 @@ import UIKit
 
 struct CloudexRootView: View {
     @EnvironmentObject private var viewModel: AppViewModel
+    @AppStorage("cloudex.lastOpenedThreadID") private var lastOpenedThreadID = ""
     @State private var navigationPath: [String] = []
     @State private var searchQuery = ""
     @State private var showingSettings = false
-    @State private var searchFieldFocused = false
+    @State private var showingQRCodeScanner = false
+    @State private var showingScannerError = false
+    @State private var scannerErrorMessage = ""
+    @FocusState private var searchFieldFocused: Bool
     @State private var keyboardHeight: CGFloat = 0
+    @State private var searchMatches: [ConversationSearchMatch] = []
+    @State private var searchRequest: Task<Void, Never>?
+    @State private var isSearchingMessages = false
+    @State private var collapsedProjectIDs: Set<String> = []
+    @State private var iPadColumnVisibility: NavigationSplitViewVisibility = .all
+    @State private var iPadPreferredCompactColumn: NavigationSplitViewColumn = .sidebar
+    @State private var showingIPadDirectory = false
+    @State private var iPadSelectedProjectID: String?
+    @State private var iPadSelectedThreadRoute: String?
+    @State private var restoredIPadSelection = false
 
     var body: some View {
-        NavigationStack(path: $navigationPath) {
-            List {
-                Section {
-                    Button {
-                        viewModel.startNewChat(projectCWD: viewModel.selectedProjectCWD)
-                        navigationPath.append("new-\(UUID().uuidString)")
-                    } label: {
-                        Label("新对话", systemImage: "square.and.pencil")
-                            .fontWeight(.semibold)
-                    }
-                }
-
-                ForEach(filteredProjects) { project in
-                    Section(project.displayName) {
-                        ForEach(project.threads) { thread in
-                            conversationButton(thread, projectCWD: project.isNoProjectLike ? nil : project.cwd)
-                        }
-                    }
-                }
-
-                if filteredProjects.isEmpty {
-                    ContentUnavailableView.search(text: searchQuery)
-                        .listRowBackground(Color.clear)
-                }
-            }
-            .scrollDismissesKeyboard(.interactively)
-            .navigationTitle("对话")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button { Task { await viewModel.refresh() } } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .accessibilityLabel("刷新对话")
-                }
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button { showingSettings = true } label: {
-                        Image(systemName: "gearshape")
-                    }
-                    .accessibilityLabel("打开设置")
-                }
-            }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                conversationSearchBar
-            }
-            .navigationDestination(for: String.self) { threadID in
-                ContentView(expectedThreadID: threadID)
-            }
-        }
+        rootNavigation
         .task {
             await viewModel.start()
             await viewModel.loadModelsIfNeeded()
+            await restoreIPadSelectionIfNeeded()
         }
         .onChange(of: navigationPath) { _, _ in
             // Do not leave the keyboard attached while transitioning to a chat.
             searchFieldFocused = false
+        }
+        .onChange(of: viewModel.threadNavigationRequest) { _, request in
+            guard let request else { return }
+            lastOpenedThreadID = request.threadID
+            if usesIPadLayout {
+                iPadSelectedThreadRoute = request.threadID
+                selectProjectContainingThread(request.threadID)
+                iPadPreferredCompactColumn = .detail
+            } else {
+                navigationPath.append(request.threadID)
+            }
+            viewModel.clearThreadNavigationRequest()
+        }
+        .onChange(of: viewModel.projects) { _, _ in
+            normalizeIPadProjectSelection()
+        }
+        .onChange(of: searchQuery) { _, query in
+            scheduleMessageSearch(query)
+        }
+        .onDisappear {
+            searchRequest?.cancel()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
             guard let value = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue else { return }
@@ -78,6 +67,307 @@ struct CloudexRootView: View {
             SettingsView(isPresented: $showingSettings)
                 .environmentObject(viewModel)
         }
+        .sheet(isPresented: $showingQRCodeScanner) {
+            NavigationStack {
+                QRCodeScannerView { code in
+                    connect(using: code)
+                } onFailure: { message in
+                    showingQRCodeScanner = false
+                    scannerErrorMessage = message
+                    showingScannerError = true
+                }
+                .ignoresSafeArea(edges: .bottom)
+                .navigationTitle("扫描连接二维码")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("取消") { showingQRCodeScanner = false }
+                    }
+                }
+            }
+        }
+        .alert("无法扫描二维码", isPresented: $showingScannerError) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(scannerErrorMessage)
+        }
+    }
+
+    private var usesIPadLayout: Bool {
+        UIDevice.current.userInterfaceIdiom == .pad
+    }
+
+    @ViewBuilder
+    private var rootNavigation: some View {
+        if usesIPadLayout {
+            iPadNavigation
+        } else {
+            phoneNavigation
+        }
+    }
+
+    private var phoneNavigation: some View {
+        NavigationStack(path: $navigationPath) {
+            List {
+                ForEach(filteredProjects) { project in
+                    Section {
+                        if !isProjectCollapsed(project) {
+                            projectNewConversationButton(project)
+
+                            ForEach(project.threads) { thread in
+                                VStack(alignment: .leading, spacing: 0) {
+                                    conversationButton(thread, projectCWD: project.isNoProjectLike ? nil : project.cwd)
+
+                                    ForEach(matchesByThreadID[thread.id] ?? []) { match in
+                                        searchMatchButton(
+                                            match,
+                                            thread: thread,
+                                            projectCWD: project.isNoProjectLike ? nil : project.cwd
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    } header: {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                toggleProject(project)
+                            }
+                        } label: {
+                            HStack {
+                                Text(project.displayName)
+                                Spacer(minLength: 8)
+                                Image(systemName: isProjectCollapsed(project) ? "chevron.right" : "chevron.down")
+                                    .font(.caption.weight(.semibold))
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("\(isProjectCollapsed(project) ? "展开" : "折叠")\(project.displayName)")
+                    }
+                }
+
+                if filteredProjects.isEmpty, !isSearchingMessages {
+                    ContentUnavailableView.search(text: searchQuery)
+                        .listRowBackground(Color.clear)
+                }
+            }
+            .refreshable { await viewModel.refresh() }
+            .scrollDismissesKeyboard(.interactively)
+            .navigationTitle("对话")
+            .toolbar { rootToolbar }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                conversationSearchBar
+            }
+            .navigationDestination(for: String.self) { threadID in
+                ContentView(expectedThreadID: threadID)
+            }
+        }
+    }
+
+    private var iPadNavigation: some View {
+        GeometryReader { geometry in
+            NavigationSplitView(
+                columnVisibility: $iPadColumnVisibility,
+                preferredCompactColumn: $iPadPreferredCompactColumn
+            ) {
+                iPadSidebarColumn
+                    .navigationSplitViewColumnWidth(
+                        min: 290,
+                        ideal: iPadSidebarWidth(for: geometry.size.width),
+                        max: 360
+                    )
+            } detail: {
+                Group {
+                    if let route = iPadSelectedThreadRoute {
+                        NavigationStack {
+                            ContentView(
+                                expectedThreadID: route,
+                                onToggleDirectory: { showingIPadDirectory = true },
+                                showsDirectoryButton: false
+                            )
+                            .id(route)
+                        }
+                        .navigationTitle(viewModel.navigationTitle)
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar {
+                            ToolbarItem(placement: .topBarTrailing) {
+                                Button { showingIPadDirectory = true } label: {
+                                    Image(systemName: "list.bullet")
+                                        .frame(width: 44, height: 44)
+                                        .contentShape(Rectangle())
+                                }
+                                .accessibilityLabel("打开对话目录")
+                            }
+                        }
+                        .toolbar(.visible, for: .navigationBar)
+                        .sheet(isPresented: $showingIPadDirectory) {
+                            NavigationStack {
+                                IPadConversationDirectoryView(
+                                    onSelect: { messageID, turnID in
+                                        requestIPadMessageJump(messageID: messageID, turnID: turnID)
+                                        showingIPadDirectory = false
+                                    },
+                                    onOpenPage: nil,
+                                    onClosePage: nil,
+                                    showsNavigationChrome: false
+                                )
+                                .navigationTitle("对话目录")
+                                .navigationBarTitleDisplayMode(.inline)
+                                .toolbar {
+                                    ToolbarItem(placement: .confirmationAction) {
+                                        Button("完成") { showingIPadDirectory = false }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        ContentUnavailableView(
+                            "选择一个对话",
+                            systemImage: "bubble.left.and.bubble.right",
+                            description: Text("从左侧栏打开对话或创建新对话。")
+                        )
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .navigationSplitViewStyle(.balanced)
+        }
+    }
+
+    private var iPadSidebarColumn: some View {
+        List {
+            ForEach(iPadSidebarProjects) { project in
+                Section {
+                    if !isProjectCollapsed(project) {
+                        Button {
+                            startNewIPadConversation(in: project)
+                        } label: {
+                            Label("新对话", systemImage: "square.and.pencil")
+                                .fontWeight(.semibold)
+                        }
+
+                        ForEach(project.threads) { thread in
+                            VStack(alignment: .leading, spacing: 0) {
+                                iPadConversationButton(thread, project: project)
+
+                                ForEach(matchesByThreadID[thread.id] ?? []) { match in
+                                    iPadSearchMatchButton(match, thread: thread, project: project)
+                                }
+                            }
+                        }
+                    }
+                } header: {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            toggleProject(project)
+                        }
+                    } label: {
+                        HStack {
+                            Text(project.displayName)
+                            Spacer(minLength: 8)
+                            Image(systemName: isProjectCollapsed(project) ? "chevron.right" : "chevron.down")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            if iPadSidebarProjects.isEmpty, !isSearchingMessages {
+                ContentUnavailableView.search(text: searchQuery)
+                    .listRowBackground(Color.clear)
+            }
+        }
+        .refreshable { await viewModel.refresh() }
+        .scrollDismissesKeyboard(.interactively)
+        .navigationTitle("对话")
+        .toolbar { rootToolbar }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            conversationSearchBar
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var rootToolbar: some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            Button { showingQRCodeScanner = true } label: {
+                Image(systemName: "qrcode.viewfinder")
+            }
+            .accessibilityLabel("扫描服务器二维码")
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+            Button { showingSettings = true } label: {
+                Image(systemName: "gearshape")
+            }
+            .accessibilityLabel("打开设置")
+        }
+    }
+
+    @ViewBuilder
+    private var iPadConversationColumn: some View {
+        if let project = iPadSelectedProject {
+            List {
+                Section {
+                    Button {
+                        startNewIPadConversation(in: project)
+                    } label: {
+                        Label("新对话", systemImage: "square.and.pencil")
+                            .fontWeight(.semibold)
+                    }
+                }
+
+                Section("对话") {
+                    ForEach(iPadVisibleThreads) { thread in
+                        VStack(alignment: .leading, spacing: 0) {
+                            iPadConversationButton(thread, project: project)
+
+                            ForEach(matchesByThreadID[thread.id] ?? []) { match in
+                                iPadSearchMatchButton(match, thread: thread, project: project)
+                            }
+                        }
+                    }
+
+                    if iPadVisibleThreads.isEmpty, !isSearchingMessages {
+                        ContentUnavailableView.search(text: searchQuery)
+                            .listRowBackground(Color.clear)
+                    }
+                }
+            }
+            .refreshable { await viewModel.refresh() }
+            .scrollDismissesKeyboard(.interactively)
+            .navigationTitle(project.displayName)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                conversationSearchBar
+            }
+        } else {
+            ContentUnavailableView(
+                "选择一个项目",
+                systemImage: "folder",
+                description: Text("从左侧栏选择项目。")
+            )
+        }
+    }
+
+    private func connect(using code: String) {
+        guard let payload = CloudexConnectionPayload(code: code) else {
+            showingQRCodeScanner = false
+            scannerErrorMessage = "这不是有效的 Cloudex 服务器连接二维码。"
+            showingScannerError = true
+            return
+        }
+
+        showingQRCodeScanner = false
+        Task {
+            let mode = payload.preferredConnectionMode
+            await viewModel.applySettings(
+                lanServerURL: mode == .lan ? payload.serverURL : viewModel.lanServerURL,
+                tailscaleServerURL: mode == .tailscale ? payload.serverURL : viewModel.tailscaleServerURL,
+                connectionMode: mode,
+                token: payload.token
+            )
+        }
     }
 
     private var filteredProjects: [CloudexProject] {
@@ -85,8 +375,10 @@ struct CloudexRootView: View {
         return viewModel.projects.compactMap { project in
             let threads = project.threads
                 .filter { thread in
-                    query.isEmpty || [thread.title, thread.preview ?? "", thread.cwd ?? "", project.displayName]
-                        .contains { $0.localizedCaseInsensitiveContains(query) }
+                    query.isEmpty
+                        || matchesByThreadID[thread.id]?.isEmpty == false
+                        || [thread.title, thread.preview ?? "", thread.cwd ?? "", project.displayName]
+                            .contains { $0.localizedCaseInsensitiveContains(query) }
                 }
                 .sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
             guard !threads.isEmpty else { return nil }
@@ -98,11 +390,268 @@ struct CloudexRootView: View {
                 updatedAt: project.updatedAt
             )
         }
-        .sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
+        .sorted { lhs, rhs in
+            if lhs.isNoProjectLike != rhs.isNoProjectLike {
+                return !lhs.isNoProjectLike
+            }
+            return (lhs.updatedAt ?? 0) > (rhs.updatedAt ?? 0)
+        }
+    }
+
+    private var iPadProjects: [CloudexProject] {
+        viewModel.projects.sorted { lhs, rhs in
+            if lhs.isNoProjectLike != rhs.isNoProjectLike {
+                return !lhs.isNoProjectLike
+            }
+            return (lhs.updatedAt ?? 0) > (rhs.updatedAt ?? 0)
+        }
+    }
+
+    private var iPadSidebarProjects: [CloudexProject] {
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        return iPadProjects.compactMap { project in
+            let threads = project.threads
+                .filter { thread in
+                    query.isEmpty
+                        || matchesByThreadID[thread.id]?.isEmpty == false
+                        || [thread.title, thread.preview ?? "", thread.cwd ?? "", project.displayName]
+                            .contains { $0.localizedCaseInsensitiveContains(query) }
+                }
+                .sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
+            guard query.isEmpty || !threads.isEmpty else { return nil }
+            return CloudexProject(
+                id: project.id,
+                name: project.name,
+                cwd: project.cwd,
+                threads: threads,
+                updatedAt: project.updatedAt
+            )
+        }
+    }
+
+    private var iPadSelectedProject: CloudexProject? {
+        iPadProjects.first { $0.id == iPadSelectedProjectID }
+    }
+
+    private var iPadVisibleThreads: [CloudexThread] {
+        guard let project = iPadSelectedProject else { return [] }
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        return project.threads
+            .filter { thread in
+                query.isEmpty
+                    || matchesByThreadID[thread.id]?.isEmpty == false
+                    || [thread.title, thread.preview ?? "", thread.cwd ?? "", project.displayName]
+                        .contains { $0.localizedCaseInsensitiveContains(query) }
+            }
+            .sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
+    }
+
+    private func iPadProjectButton(_ project: CloudexProject) -> some View {
+        Button {
+            iPadSelectedProjectID = project.id
+            viewModel.selectProject(project.isNoProjectLike ? nil : project.cwd)
+            searchQuery = ""
+        } label: {
+            ProjectRow(project: project)
+                .equatable()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(
+            iPadSelectedProjectID == project.id
+                ? Color.accentColor.opacity(0.14)
+                : Color.clear
+        )
+    }
+
+    private func iPadConversationButton(_ thread: CloudexThread, project: CloudexProject) -> some View {
+        Button {
+            openIPadThread(thread, project: project)
+        } label: {
+            ThreadRow(thread: thread)
+                .equatable()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(
+            iPadSelectedThreadRoute == thread.id
+                ? Color.accentColor.opacity(0.12)
+                : Color.clear
+        )
+        .swipeActions {
+            Button(role: .destructive) {
+                Task { await viewModel.archive(thread.id) }
+            } label: {
+                Label("归档", systemImage: "archivebox")
+            }
+        }
+    }
+
+    private func iPadSearchMatchButton(
+        _ match: ConversationSearchMatch,
+        thread: CloudexThread,
+        project: CloudexProject
+    ) -> some View {
+        Button {
+            viewModel.requestMessageJump(
+                threadID: thread.id,
+                messageID: match.messageId,
+                turnID: match.turnId,
+                query: searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            openIPadThread(thread, project: project, clearJumpRequest: false)
+        } label: {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: match.role == "user" ? "person.fill" : "sparkles")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18, height: 18)
+
+                Text(searchHighlightedText(match.snippet))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.leading, 12)
+            .padding(.trailing, 4)
+            .padding(.vertical, 8)
+            .overlay(alignment: .top) {
+                Divider().padding(.leading, 38)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("跳转到匹配消息：\(match.snippet)")
+    }
+
+    private func openIPadThread(
+        _ thread: CloudexThread,
+        project: CloudexProject,
+        clearJumpRequest: Bool = true
+    ) {
+        if clearJumpRequest { viewModel.clearMessageJumpRequest() }
+        iPadSelectedProjectID = project.id
+        iPadSelectedThreadRoute = thread.id
+        iPadPreferredCompactColumn = .detail
+        lastOpenedThreadID = thread.id
+        searchFieldFocused = false
+        Task {
+            await viewModel.openThread(
+                thread,
+                projectCWD: project.isNoProjectLike ? nil : project.cwd
+            )
+        }
+    }
+
+    private func startNewIPadConversation(in project: CloudexProject) {
+        let projectCWD = project.isNoProjectLike ? nil : project.cwd
+        viewModel.clearMessageJumpRequest()
+        iPadSelectedProjectID = project.id
+        if projectCWD == nil { viewModel.selectProject(nil) }
+        viewModel.startNewChat(projectCWD: projectCWD)
+        iPadSelectedThreadRoute = "new-\(UUID().uuidString)"
+        iPadPreferredCompactColumn = .detail
+        searchFieldFocused = false
+    }
+
+    private func requestIPadMessageJump(messageID: String, turnID: String) {
+        guard let threadID = viewModel.selectedThreadID else { return }
+        viewModel.requestMessageJump(
+            threadID: threadID,
+            messageID: messageID,
+            turnID: turnID,
+            query: ""
+        )
+    }
+
+    private func iPadSidebarWidth(for totalWidth: CGFloat) -> CGFloat {
+        min(340, max(290, totalWidth * 0.36))
+    }
+
+    private func restoreIPadSelectionIfNeeded() async {
+        guard usesIPadLayout, !restoredIPadSelection else { return }
+        restoredIPadSelection = true
+
+        let target = iPadProjects
+            .flatMap { project in project.threads.map { (project, $0) } }
+            .first { $0.1.id == lastOpenedThreadID }
+            ?? iPadProjects
+                .flatMap { project in project.threads.map { (project, $0) } }
+                .max { ($0.1.updatedAt ?? 0) < ($1.1.updatedAt ?? 0) }
+
+        guard let (project, thread) = target else {
+            normalizeIPadProjectSelection()
+            return
+        }
+        iPadSelectedProjectID = project.id
+        iPadSelectedThreadRoute = thread.id
+        lastOpenedThreadID = thread.id
+        await viewModel.openThread(
+            thread,
+            projectCWD: project.isNoProjectLike ? nil : project.cwd
+        )
+    }
+
+    private func normalizeIPadProjectSelection() {
+        guard usesIPadLayout else { return }
+        if let selected = iPadSelectedProjectID,
+           iPadProjects.contains(where: { $0.id == selected }) {
+            return
+        }
+        iPadSelectedProjectID = iPadProjects.first?.id
+    }
+
+    private func selectProjectContainingThread(_ threadID: String) {
+        guard let project = iPadProjects.first(where: { project in
+            project.threads.contains(where: { $0.id == threadID })
+        }) else { return }
+        iPadSelectedProjectID = project.id
+    }
+
+    private func isProjectCollapsed(_ project: CloudexProject) -> Bool {
+        let isSearching = !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return !isSearching && collapsedProjectIDs.contains(project.id)
+    }
+
+    private func toggleProject(_ project: CloudexProject) {
+        if collapsedProjectIDs.contains(project.id) {
+            collapsedProjectIDs.remove(project.id)
+        } else {
+            collapsedProjectIDs.insert(project.id)
+        }
+    }
+
+    private var matchesByThreadID: [String: [ConversationSearchMatch]] {
+        Dictionary(grouping: searchMatches, by: \.threadId)
+    }
+
+    private func projectNewConversationButton(_ project: CloudexProject) -> some View {
+        Button {
+            let projectCWD = project.isNoProjectLike ? nil : project.cwd
+            viewModel.clearMessageJumpRequest()
+            // startNewChat normally preserves the current project when it is
+            // passed nil. Clear it first so the “无项目” section really opens
+            // an unscoped conversation instead of reusing the previous cwd.
+            if projectCWD == nil { viewModel.selectProject(nil) }
+            viewModel.startNewChat(projectCWD: projectCWD)
+            navigationPath.append("new-\(UUID().uuidString)")
+        } label: {
+            Label("新对话", systemImage: "square.and.pencil")
+                .fontWeight(.semibold)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel("在\(project.displayName)中新建对话")
     }
 
     private func conversationButton(_ thread: CloudexThread, projectCWD: String?) -> some View {
         Button {
+            viewModel.clearMessageJumpRequest()
+            lastOpenedThreadID = thread.id
             // Push immediately so the navigation bar switches to the child
             // page while the thread data is loading.
             navigationPath.append(thread.id)
@@ -125,16 +674,132 @@ struct CloudexRootView: View {
         }
     }
 
-    private var conversationSearchBar: some View {
-        HStack(spacing: 8) {
-            SystemSearchField(
-                text: $searchQuery,
-                isFocused: $searchFieldFocused,
-                prompt: "搜索对话"
+    private func searchMatchButton(
+        _ match: ConversationSearchMatch,
+        thread: CloudexThread,
+        projectCWD: String?
+    ) -> some View {
+        Button {
+            viewModel.requestMessageJump(
+                threadID: thread.id,
+                messageID: match.messageId,
+                turnID: match.turnId,
+                query: searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
             )
-            .padding(.horizontal, 4)
+            lastOpenedThreadID = thread.id
+            navigationPath.append(thread.id)
+            Task {
+                await viewModel.openThread(thread, projectCWD: projectCWD)
+            }
+        } label: {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: match.role == "user" ? "person.fill" : "sparkles")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18, height: 18)
+
+                Text(searchHighlightedText(match.snippet))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.leading, 12)
+            .padding(.trailing, 4)
+            .padding(.vertical, 8)
+            .overlay(alignment: .top) {
+                Divider().padding(.leading, 38)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("跳转到匹配消息：\(match.snippet)")
+    }
+
+    private func searchHighlightedText(_ text: String) -> AttributedString {
+        highlightedAttributedString(
+            text,
+            query: searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
+    private func scheduleMessageSearch(_ query: String) {
+        searchRequest?.cancel()
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            searchMatches = []
+            isSearchingMessages = false
+            return
+        }
+        isSearchingMessages = true
+        searchRequest = Task {
+            try? await Task.sleep(for: .milliseconds(280))
+            guard !Task.isCancelled else { return }
+            let matches = await viewModel.searchConversationMessages(trimmed)
+            guard !Task.isCancelled,
+                  searchQuery.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed else { return }
+            searchMatches = matches
+            isSearchingMessages = false
+        }
+    }
+
+    @ViewBuilder
+    private var conversationSearchBar: some View {
+        if #available(iOS 26.0, *) {
+            // Keep the resting shapes visually separate. The smaller merge
+            // threshold still lets the interactive glass expansion join them
+            // while the field or close button is being pressed.
+            GlassEffectContainer(spacing: 4) {
+                conversationSearchControls(useLiquidGlass: true)
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 10)
+            .padding(.bottom, bottomControlPadding)
+        } else {
+            conversationSearchControls(useLiquidGlass: false)
+                .padding(.horizontal, 24)
+                .padding(.top, 10)
+                .padding(.bottom, bottomControlPadding)
+        }
+    }
+
+    private var bottomControlPadding: CGFloat {
+        if keyboardHeight > 0 { return 18 }
+        // Keep the floating iPad window's native bottom safe-area inset. The
+        // iPhone-specific negative adjustment otherwise cancels that spacing.
+        return UIDevice.current.userInterfaceIdiom == .pad ? 0 : -7
+    }
+
+    private func conversationSearchControls(useLiquidGlass: Bool) -> some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+
+                TextField("搜索对话", text: $searchQuery)
+                    .focused($searchFieldFocused)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.search)
+                    .onSubmit { searchFieldFocused = false }
+
+                if !searchQuery.isEmpty {
+                    Button {
+                        searchQuery = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("清除搜索内容")
+                }
+            }
+            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity)
             .frame(height: 52)
-            .rootLiquidGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous), interactive: true)
+            .contentShape(Capsule())
+            .modifier(SearchFieldSurface(useLiquidGlass: useLiquidGlass))
 
             if searchFieldFocused {
                 Button {
@@ -144,24 +809,144 @@ struct CloudexRootView: View {
                     Image(systemName: "xmark")
                         .font(.system(size: 15, weight: .semibold))
                         .frame(width: 52, height: 52)
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .rootLiquidGlass(in: Circle(), interactive: true)
-                .contentShape(Circle())
-                .zIndex(20)
+                .modifier(SearchCloseSurface(useLiquidGlass: useLiquidGlass))
                 .accessibilityLabel("退出搜索")
-                .transition(.scale.combined(with: .opacity))
+                .transition(.scale(scale: 0.65).combined(with: .opacity))
             }
         }
-        .animation(.easeInOut(duration: 0.16), value: searchFieldFocused)
-        .shadow(color: .black.opacity(0.14), radius: 16, y: 7)
-        // Match the device's bottom corner geometry: leave a wider side
-        // inset and visually settle the controls into the bottom safe area.
-        .padding(.horizontal, 24)
-        .padding(.top, 10)
-        .padding(.bottom, keyboardHeight > 0 ? 18 : -7)
+        .animation(.easeInOut(duration: 0.2), value: searchFieldFocused)
     }
 
+}
+
+private struct SearchFieldSurface: ViewModifier {
+    let useLiquidGlass: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *), useLiquidGlass {
+            content.glassEffect(.regular.interactive(), in: Capsule())
+        } else {
+            content.background(.ultraThinMaterial, in: Capsule())
+        }
+    }
+}
+
+private struct SearchCloseSurface: ViewModifier {
+    let useLiquidGlass: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *), useLiquidGlass {
+            content.glassEffect(.regular.interactive(), in: Circle())
+        } else {
+            content.background(.ultraThinMaterial, in: Circle())
+        }
+    }
+}
+
+private final class SearchBarGlassContainerView: UIView {
+    let searchBar = UISearchBar(frame: .zero)
+    private var glassContentView: UIView?
+    private var searchFieldGlassView: UIVisualEffectView?
+    private var cancelButtonGlassView: UIVisualEffectView?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+
+        let hostView: UIView
+        if #available(iOS 26.0, *) {
+            let containerEffect = UIGlassContainerEffect()
+            // Apple defines this as the distance at which neighboring glass
+            // elements begin merging. Keep it slightly wider than the native
+            // search bar gap so the cancel button visibly adheres to the field.
+            containerEffect.spacing = 20
+            let effectView = UIVisualEffectView(effect: containerEffect)
+            effectView.backgroundColor = .clear
+            hostView = effectView
+
+            let fieldEffect = UIGlassEffect(style: .regular)
+            fieldEffect.isInteractive = true
+            let fieldGlassView = UIVisualEffectView(effect: fieldEffect)
+            fieldGlassView.isUserInteractionEnabled = false
+
+            let cancelEffect = UIGlassEffect(style: .regular)
+            cancelEffect.isInteractive = true
+            let cancelGlassView = UIVisualEffectView(effect: cancelEffect)
+            cancelGlassView.isUserInteractionEnabled = false
+            cancelGlassView.isHidden = true
+
+            effectView.contentView.addSubview(fieldGlassView)
+            effectView.contentView.addSubview(cancelGlassView)
+            effectView.contentView.addSubview(searchBar)
+            glassContentView = effectView.contentView
+            searchFieldGlassView = fieldGlassView
+            cancelButtonGlassView = cancelGlassView
+        } else {
+            hostView = UIView(frame: .zero)
+            hostView.addSubview(searchBar)
+        }
+
+        backgroundColor = .clear
+        hostView.translatesAutoresizingMaskIntoConstraints = false
+        searchBar.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(hostView)
+
+        NSLayoutConstraint.activate([
+            hostView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            hostView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            hostView.topAnchor.constraint(equalTo: topAnchor),
+            hostView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            searchBar.leadingAnchor.constraint(equalTo: hostView.leadingAnchor),
+            searchBar.trailingAnchor.constraint(equalTo: hostView.trailingAnchor),
+            searchBar.topAnchor.constraint(equalTo: hostView.topAnchor),
+            searchBar.bottomAnchor.constraint(equalTo: hostView.bottomAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard #available(iOS 26.0, *),
+              let glassContentView,
+              let searchFieldGlassView,
+              let cancelButtonGlassView else { return }
+
+        searchBar.layoutIfNeeded()
+
+        let textField = searchBar.searchTextField
+        let fieldFrame = textField.convert(textField.bounds, to: glassContentView)
+        searchFieldGlassView.frame = fieldFrame
+        searchFieldGlassView.layer.cornerRadius = fieldFrame.height / 2
+        searchFieldGlassView.layer.cornerCurve = .continuous
+        searchFieldGlassView.clipsToBounds = true
+
+        let cancelButton = allSubviews(of: searchBar)
+            .compactMap { $0 as? UIButton }
+            .first { !$0.isDescendant(of: textField) && !$0.isHidden && $0.alpha > 0.01 }
+
+        guard let cancelButton else {
+            cancelButtonGlassView.isHidden = true
+            return
+        }
+
+        let cancelFrame = cancelButton.convert(cancelButton.bounds, to: glassContentView)
+        cancelButtonGlassView.frame = cancelFrame
+        cancelButtonGlassView.layer.cornerRadius = cancelFrame.height / 2
+        cancelButtonGlassView.layer.cornerCurve = .continuous
+        cancelButtonGlassView.clipsToBounds = true
+        cancelButtonGlassView.isHidden = cancelFrame.isEmpty
+    }
+
+    private func allSubviews(of view: UIView) -> [UIView] {
+        view.subviews + view.subviews.flatMap(allSubviews(of:))
+    }
 }
 
 private struct SystemSearchField: UIViewRepresentable {
@@ -173,41 +958,27 @@ private struct SystemSearchField: UIViewRepresentable {
         Coordinator(self)
     }
 
-    func makeUIView(context: Context) -> UISearchBar {
-        let searchBar = UISearchBar(frame: .zero)
+    func makeUIView(context: Context) -> SearchBarGlassContainerView {
+        let container = SearchBarGlassContainerView(frame: .zero)
+        let searchBar = container.searchBar
         searchBar.delegate = context.coordinator
-        searchBar.searchBarStyle = .minimal
+        searchBar.searchBarStyle = .default
         searchBar.placeholder = prompt
         searchBar.autocapitalizationType = .none
         searchBar.autocorrectionType = .no
         searchBar.returnKeyType = .search
-        searchBar.backgroundImage = UIImage()
-        searchBar.backgroundColor = .clear
-        searchBar.searchTextField.backgroundColor = .clear
-        searchBar.searchTextField.clearButtonMode = .whileEditing
-        searchBar.searchTextField.borderStyle = .none
-        searchBar.searchTextField.textColor = .label
-        searchBar.searchTextField.contentVerticalAlignment = .center
-        let iconContainer = UIView(frame: CGRect(x: 0, y: 0, width: 24, height: 24))
-        let iconView = UIImageView(image: UIImage(systemName: "magnifyingglass"))
-        iconView.tintColor = .secondaryLabel
-        iconView.contentMode = .scaleAspectFit
-        iconView.translatesAutoresizingMaskIntoConstraints = false
-        iconContainer.addSubview(iconView)
-        NSLayoutConstraint.activate([
-            iconView.leadingAnchor.constraint(equalTo: iconContainer.leadingAnchor, constant: 2),
-            iconView.trailingAnchor.constraint(equalTo: iconContainer.trailingAnchor, constant: -2),
-            iconView.centerYAnchor.constraint(equalTo: iconContainer.centerYAnchor),
-            iconView.heightAnchor.constraint(equalToConstant: 20)
-        ])
-        searchBar.searchTextField.leftView = iconContainer
-        searchBar.searchTextField.leftViewMode = .always
-        return searchBar
+        searchBar.setShowsCancelButton(false, animated: false)
+        return container
     }
 
-    func updateUIView(_ searchBar: UISearchBar, context: Context) {
+    func updateUIView(_ container: SearchBarGlassContainerView, context: Context) {
+        context.coordinator.parent = self
+        let searchBar = container.searchBar
         if searchBar.text != text {
             searchBar.text = text
+        }
+        if searchBar.showsCancelButton != isFocused {
+            searchBar.setShowsCancelButton(isFocused, animated: searchBar.window != nil)
         }
         if isFocused, !searchBar.isFirstResponder {
             searchBar.becomeFirstResponder()
@@ -239,23 +1010,19 @@ private struct SystemSearchField: UIViewRepresentable {
 
         func searchBarTextDidBeginEditing(_ searchBar: UISearchBar) {
             parent.isFocused = true
+            searchBar.setShowsCancelButton(true, animated: true)
         }
 
         func searchBarTextDidEndEditing(_ searchBar: UISearchBar) {
             parent.isFocused = false
         }
-    }
-}
 
-private extension View {
-    @ViewBuilder
-    func rootLiquidGlass<S: Shape>(in shape: S, interactive: Bool = false) -> some View {
-        if #available(iOS 26.0, *) {
-            self.glassEffect(.regular.interactive(interactive), in: shape)
-        } else {
-            self
-                .background(.ultraThinMaterial, in: shape)
-                .overlay(shape.stroke(Color.white.opacity(0.32), lineWidth: 0.7))
+        func searchBarCancelButtonClicked(_ searchBar: UISearchBar) {
+            parent.text = ""
+            parent.isFocused = false
+            searchBar.text = ""
+            searchBar.setShowsCancelButton(false, animated: true)
+            searchBar.resignFirstResponder()
         }
     }
 }

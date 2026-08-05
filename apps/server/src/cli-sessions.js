@@ -514,7 +514,7 @@ function parseSessionLine(state, record) {
       }
       return;
     }
-    if (payload.type === "function_call" && ["exec_command", "exec", "shell"].includes(payload.name)) {
+    if (payload.type === "function_call" && ["exec_command", "exec", "shell", "shell_command"].includes(payload.name)) {
       const args = typeof payload.arguments === "object"
         ? payload.arguments
         : (safeJson(payload.arguments) || {});

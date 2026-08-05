@@ -49,6 +49,9 @@ struct SettingsView: View {
                     SecureField("AUTH_TOKEN", text: $token)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                    Text(viewModel.status)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("最近连接") {
@@ -109,16 +112,18 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Section("状态") {
-                    Text(viewModel.status)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
             }
             .navigationTitle("设置")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { isPresented = false }
+                    Button {
+                        Task {
+                            await viewModel.reconnect()
+                        }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .accessibilityLabel("重新连接")
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("保存") {
@@ -225,6 +230,17 @@ final class QRCodeScannerViewController: UIViewController, AVCaptureMetadataOutp
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         previewLayer?.frame = view.bounds
+        updateVideoOrientation()
+    }
+
+    override func viewWillTransition(
+        to size: CGSize,
+        with coordinator: UIViewControllerTransitionCoordinator
+    ) {
+        super.viewWillTransition(to: size, with: coordinator)
+        coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+            self?.updateVideoOrientation()
+        }
     }
 
     func stopScanning() {
@@ -279,7 +295,33 @@ final class QRCodeScannerViewController: UIViewController, AVCaptureMetadataOutp
             view.setNeedsLayout()
         }
 
+        updateVideoOrientation()
         if !captureSession.isRunning { captureSession.startRunning() }
+    }
+
+    private func updateVideoOrientation() {
+        guard let interfaceOrientation = view.window?.windowScene?.interfaceOrientation else { return }
+        let videoOrientation: AVCaptureVideoOrientation
+        switch interfaceOrientation {
+        case .portrait:
+            videoOrientation = .portrait
+        case .portraitUpsideDown:
+            videoOrientation = .portraitUpsideDown
+        case .landscapeLeft:
+            videoOrientation = .landscapeLeft
+        case .landscapeRight:
+            videoOrientation = .landscapeRight
+        default:
+            return
+        }
+
+        if let connection = previewLayer?.connection,
+           connection.isVideoOrientationSupported {
+            connection.videoOrientation = videoOrientation
+        }
+        for connection in captureSession.connections where connection.isVideoOrientationSupported {
+            connection.videoOrientation = videoOrientation
+        }
     }
 
     private func fail(_ message: String) {

@@ -10,6 +10,7 @@ final class AppViewModel: ObservableObject {
     @Published var authToken: String
     @Published var selectedModelID: String
     @Published var selectedEffortID: String
+    @Published var codexMode: CodexExecutionMode
     @Published var projects: [CloudexProject] = []
     @Published var renderedMessages: [ChatMessage] = []
     @Published var models: [CodexModel] = []
@@ -83,6 +84,9 @@ final class AppViewModel: ObservableObject {
         // selection still applies for the current run and subsequent turns.
         selectedModelID = ""
         selectedEffortID = defaults.string(forKey: "cloudex.effort") ?? ""
+        codexMode = CodexExecutionMode(
+            rawValue: defaults.string(forKey: "cloudex.codexMode") ?? ""
+        ) ?? .requestApproval
         notifyApprovals = defaults.object(forKey: "cloudex.notifyApprovals") as? Bool ?? true
         notifyTaskSuccess = defaults.object(forKey: "cloudex.notifyTaskSuccess") as? Bool ?? true
         notifyTaskFailure = defaults.object(forKey: "cloudex.notifyTaskFailure") as? Bool ?? true
@@ -259,17 +263,21 @@ final class AppViewModel: ObservableObject {
                 isCompressed: true
             )
         }
-        if item.type == "commandExecution" || item.command != nil {
-            guard let command = item.command?.trimmingCharacters(in: .whitespacesAndNewlines), !command.isEmpty else { return nil }
-            let execution = semanticExecution(command: command, activity: item.activity, status: item.status)
+        if item.type == "commandExecution" || item.command != nil || item.activity == "edited" || item.diff != nil {
+            let command = item.command?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let execution = command.map { semanticExecution(command: $0, activity: item.activity, status: item.status) }
+            let text = item.activity == "edited"
+                ? editSummary(from: item.diff) ?? execution?.text ?? "Edited files"
+                : execution?.text ?? item.renderedText
+            let kind = execution?.kind ?? (item.activity == "edited" ? "edit" : "run")
             return ChatMessage(
                 id: item.id ?? "\(turnID)-command-\(fallbackIndex)",
                 role: .execution,
-                text: execution.text,
+                text: text,
                 executionStatus: item.status,
                 executionDuration: item.duration,
                 executionExitCode: item.exitCode,
-                executionKind: execution.kind,
+                executionKind: kind,
                 editDiff: item.diff,
                 createdAt: item.createdAt
             )
@@ -735,15 +743,14 @@ final class AppViewModel: ObservableObject {
         }
         guard let changes = item["changes"] as? [[String: Any]] else { return nil }
         let payloads = changes.compactMap { change -> EditDiffPayload? in
-            guard let name = change["path"] as? String ?? change["filePath"] as? String,
-                  let diff = change["diff"] as? String,
-                  !diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            guard let name = editPath(from: change) else { return nil }
+            let diff = change["diff"] as? String
             var oldLine = 1
             var newLine = 1
             var additions = 0
             var deletions = 0
             var lines: [EditDiffLinePayload] = []
-            for raw in diff.replacingOccurrences(of: "\r\n", with: "\n").split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
+            for raw in (diff ?? "").replacingOccurrences(of: "\r\n", with: "\n").split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
                 if raw.hasPrefix("@@") {
                     lines.append(EditDiffLinePayload(kind: "header", text: raw.trimmingCharacters(in: .whitespaces), lineNumber: nil))
                     let ranges = raw.split(whereSeparator: { $0.isWhitespace })
@@ -768,9 +775,45 @@ final class AppViewModel: ObservableObject {
                     newLine += 1
                 }
             }
+            if lines.isEmpty {
+                additions = editCount(from: change, keys: ["additions", "added", "addedLines", "insertions"])
+                deletions = editCount(from: change, keys: ["deletions", "deleted", "deletedLines", "removals"])
+            }
+            guard !lines.isEmpty || additions > 0 || deletions > 0 else { return nil }
             return EditDiffPayload(name: name, additions: additions, deletions: deletions, lines: lines)
         }
         return payloads.isEmpty ? nil : payloads
+    }
+
+    private func editSummary(from payloads: [EditDiffPayload]?) -> String? {
+        let summaries = (payloads ?? []).compactMap { payload -> String? in
+            let name = editDisplayName(payload.name)
+            guard !name.isEmpty else { return nil }
+            let additions = payload.additions ?? payload.lines?.filter { $0.kind == "addition" }.count ?? 0
+            let deletions = payload.deletions ?? payload.lines?.filter { $0.kind == "deletion" }.count ?? 0
+            return "\(name) +\(additions) -\(deletions)"
+        }
+        return summaries.isEmpty ? nil : summaries.joined(separator: "\n")
+    }
+
+    private func editPath(from change: [String: Any]) -> String? {
+        ["path", "filePath", "relativePath", "name", "file"]
+            .compactMap { change[$0] as? String }
+            .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    private func editCount(from change: [String: Any], keys: [String]) -> Int {
+        for key in keys {
+            if let value = change[key] as? NSNumber { return max(value.intValue, 0) }
+            if let value = change[key] as? Int { return max(value, 0) }
+        }
+        return 0
+    }
+
+    private func editDisplayName(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        return (trimmed as NSString).lastPathComponent
     }
 
     private func upsertLiveExecution(
@@ -784,11 +827,12 @@ final class AppViewModel: ObservableObject {
         let activity = item["activity"] as? String
             ?? (type.contains("filechange") ? "edited" : nil)
         let changedPaths = (item["changes"] as? [[String: Any]] ?? []).compactMap { change in
-            change["path"] as? String ?? change["filePath"] as? String
+            editPath(from: change)
         }
         let existingIndex = liveMessages.firstIndex(where: { $0.id == id })
         let previous = existingIndex.map { liveMessages[$0] }
         let editDiff = activity == "edited" ? liveEditDiff(from: item) : nil
+        let editText = activity == "edited" ? editSummary(from: editDiff) : nil
         // Codex uses different payload shapes for shell exploration and file
         // edits. Edits may not have a command at all, so do not discard them.
         let rawCommand = (item["command"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -803,7 +847,8 @@ final class AppViewModel: ObservableObject {
         let message = ChatMessage(
             id: id,
             role: .execution,
-            text: execution?.text
+            text: editText
+                ?? execution?.text
                 ?? previous?.text
                 ?? (activity == "edited" ? "Edited files" : activity == "explored" ? "Explored workspace" : "Ran tool"),
             executionStatus: status,
@@ -972,6 +1017,7 @@ final class AppViewModel: ObservableObject {
                 serverURL = candidate
                 isServerReachable = true
                 applyProjects(projectResponse.data)
+                await synchronizeSelectedThreadIfNeeded(from: projectResponse.data)
                 if let approvalsResponse { pendingApprovals = approvalsResponse.data }
                 status = "已连接 · \(activeConnectionTitle) · \(Date().formatted(date: .omitted, time: .standard))"
                 if switchedConnection && streamsStarted {
@@ -985,6 +1031,17 @@ final class AppViewModel: ObservableObject {
         }
         isServerReachable = false
         status = "连接失败：\(lastError?.localizedDescription ?? "无法访问局域网或 Tailscale 地址")"
+    }
+
+    func reconnect() async {
+        globalSSE.stop()
+        threadSSE.stop()
+        streamsStarted = false
+        await refresh()
+        guard isServerReachable else { return }
+        streamsStarted = true
+        connectGlobalStream()
+        if let selectedThreadID { connectThreadStream(threadID: selectedThreadID) }
     }
 
     func loadModelsIfNeeded(force: Bool = false) async {
@@ -1251,6 +1308,7 @@ final class AppViewModel: ObservableObject {
         var body: [String: Any] = [:]
         if !selectedModelID.isEmpty { body["model"] = selectedModelID }
         if !selectedEffortID.isEmpty { body["effort"] = selectedEffortID }
+        body.merge(codexModePayload) { _, new in new }
         if !attachedFiles.isEmpty { body["files"] = attachedFiles.map { ["path": $0.path] } }
         do {
             if let selectedThreadID {
@@ -1325,6 +1383,7 @@ final class AppViewModel: ObservableObject {
         if let editedMessage { payload["message"] = editedMessage }
         if !selectedModelID.isEmpty { payload["model"] = selectedModelID }
         if !selectedEffortID.isEmpty { payload["effort"] = selectedEffortID }
+        payload.merge(codexModePayload) { _, new in new }
         do {
             let result: ForkThreadResponse = try await client.post(
                 client.threadPath(threadID, action: "fork"),
@@ -1381,6 +1440,26 @@ final class AppViewModel: ObservableObject {
         try await client.download("/api/file", queryItems: [URLQueryItem(name: "path", value: path)])
     }
 
+    func loadProjectReview(path: String) async throws -> ProjectReviewResponse {
+        var lastError: Error?
+        for candidate in connectionCandidates {
+            do {
+                let candidateClient = APIClient(serverURL: candidate, token: authToken)
+                let response: ProjectReviewResponse = try await candidateClient.get(
+                    "/api/review",
+                    queryItems: [URLQueryItem(name: "path", value: path)]
+                )
+                if normalizedURL(serverURL) != candidate {
+                    serverURL = candidate
+                }
+                return response
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError ?? APIClientError.invalidServerURL
+    }
+
     func searchConversationMessages(_ query: String) async -> [ConversationSearchMatch] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
@@ -1433,6 +1512,20 @@ final class AppViewModel: ObservableObject {
         guard availableEfforts.contains(where: { $0.reasoningEffort == effortID }) else { return }
         selectedEffortID = effortID
         UserDefaults.standard.set(selectedEffortID, forKey: "cloudex.effort")
+    }
+
+    func selectCodexMode(_ mode: CodexExecutionMode) {
+        codexMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: "cloudex.codexMode")
+    }
+
+    private var codexModePayload: [String: Any] {
+        [
+            "sandbox": codexMode.sandbox,
+            "approvalPolicy": codexMode.approvalPolicy,
+            "approvalsReviewer": codexMode.approvalsReviewer,
+            "sandboxPolicy": ["type": codexMode.sandboxPolicyType],
+        ]
     }
 
     private func normalizeEffortForSelectedModel() {
@@ -1499,6 +1592,28 @@ final class AppViewModel: ObservableObject {
         conversationCache.saveProjects(value)
         if let selectedProjectCWD, !value.contains(where: { $0.cwd == selectedProjectCWD }) {
             self.selectedProjectCWD = nil
+        }
+    }
+
+    private func synchronizeSelectedThreadIfNeeded(from snapshotProjects: [CloudexProject]) async {
+        guard let selectedThreadID,
+              let snapshotThread = snapshotProjects
+                .flatMap(\.threads)
+                .first(where: { $0.id == selectedThreadID }),
+              snapshotThread.isActive || active else { return }
+
+        let wasActive = active
+        guard self.selectedThreadID == selectedThreadID else { return }
+        await loadThread(selectedThreadID, force: true)
+        guard self.selectedThreadID == selectedThreadID else { return }
+
+        if active, !wasActive {
+            connectThreadStream(threadID: selectedThreadID)
+            startPolling(threadID: selectedThreadID)
+        } else if !active, wasActive {
+            threadSSE.stop()
+            pollTask?.cancel()
+            pollTask = nil
         }
     }
 
@@ -1579,11 +1694,7 @@ final class AppViewModel: ObservableObject {
         if event.name == "threads/changed",
            let snapshot = try? JSONDecoder().decode(ProjectSnapshot.self, from: event.data) {
             applyProjects(snapshot.projects)
-            if let selectedThreadID,
-               snapshot.projects.flatMap(\.threads).contains(where: { $0.id == selectedThreadID }),
-               active {
-                Task { await loadThread(selectedThreadID, force: true) }
-            }
+            Task { await synchronizeSelectedThreadIfNeeded(from: snapshot.projects) }
         }
     }
 

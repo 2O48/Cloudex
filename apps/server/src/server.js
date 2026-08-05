@@ -2,6 +2,8 @@ import http from "node:http";
 import os from "node:os";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { execFile as execFileCallback } from "node:child_process";
+import { promisify } from "node:util";
 import { config } from "./config.js";
 import { CodexClient, CodexError } from "./codex-client.js";
 import { archiveCliThread, listCliThreads, readCliThreadById } from "./cli-sessions.js";
@@ -15,6 +17,7 @@ import { printConnectionQRCode } from "./connection-qr.js";
 import { normalizeAllowedPath } from "./file-roots.js";
 
 const client = new CodexClient();
+const execFile = promisify(execFileCallback);
 const subscribers = new Map();
 const globalSubscribers = new Set();
 const eventHistory = new Map();
@@ -335,6 +338,17 @@ function normalizePath(candidate) {
   });
 }
 
+function sandboxPolicyFor(sandbox) {
+  switch (sandbox) {
+  case "danger-full-access":
+    return { type: "dangerFullAccess" };
+  case "read-only":
+    return { type: "readOnly" };
+  default:
+    return { type: "workspaceWrite" };
+  }
+}
+
 function authOk(req, url) {
   if (!config.authToken) return config.isLoopback;
   const header = req.headers.authorization;
@@ -523,6 +537,185 @@ async function fileListing(candidate) {
       };
     }));
   return { path: dir, entries: data };
+}
+
+async function runGit(cwd, args, { allowFailure = false } = {}) {
+  try {
+    return await execFile("git", args, {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: 32 * 1024 * 1024,
+    });
+  } catch (error) {
+    if (allowFailure && (error.code === 1 || error.code === 128)) {
+      return { stdout: error.stdout || "", stderr: error.stderr || "", code: error.code };
+    }
+    throw error;
+  }
+}
+
+async function resolveReviewBase(gitRoot) {
+  const candidates = [];
+  try {
+    const { stdout } = await runGit(gitRoot, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
+    if (stdout.trim()) candidates.push(stdout.trim());
+  } catch {
+    // Repositories without origin/HEAD are handled by the conventional names below.
+  }
+  candidates.push("origin/main", "origin/master");
+
+  for (const candidate of [...new Set(candidates)]) {
+    try {
+      await runGit(gitRoot, ["rev-parse", "--verify", `${candidate}^{commit}`]);
+      return candidate;
+    } catch {
+      // Try the next local origin ref.
+    }
+  }
+
+  const error = new Error("未找到可用的 origin 分支");
+  error.status = 409;
+  throw error;
+}
+
+function parseGitNameStatus(value) {
+  const tokens = value.split("\0").filter(Boolean);
+  const records = [];
+  for (let index = 0; index < tokens.length;) {
+    const status = tokens[index++];
+    if (!status) continue;
+    if (status.startsWith("R") || status.startsWith("C")) {
+      records.push({ status: status.startsWith("R") ? "renamed" : "copied", oldPath: tokens[index++], path: tokens[index++] });
+    } else {
+      const statusCode = status[0];
+      records.push({
+        status: statusCode === "A" ? "added" : statusCode === "D" ? "deleted" : "modified",
+        oldPath: null,
+        path: tokens[index++],
+      });
+    }
+  }
+  return records;
+}
+
+function parseUnifiedDiff(value) {
+  const blocks = [];
+  let current = null;
+  let oldLine = 0;
+  let newLine = 0;
+  let inHunk = false;
+
+  for (const rawLine of value.split("\n")) {
+    if (rawLine.startsWith("diff --git ")) {
+      if (current) blocks.push(current);
+      current = { lines: [], binary: false };
+      inHunk = false;
+      continue;
+    }
+    if (!current) continue;
+    if (rawLine.startsWith("Binary files ") || rawLine.startsWith("GIT binary patch")) {
+      current.binary = true;
+      continue;
+    }
+    const hunk = rawLine.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk || rawLine.startsWith("\\ No newline at end of file")) continue;
+    const prefix = rawLine[0];
+    if (prefix === "+") {
+      current.lines.push({ kind: "addition", text: rawLine.slice(1), lineNumber: newLine++ });
+    } else if (prefix === "-") {
+      current.lines.push({ kind: "deletion", text: rawLine.slice(1), lineNumber: oldLine++ });
+    } else if (prefix === " ") {
+      current.lines.push({ kind: "context", text: rawLine.slice(1), lineNumber: newLine });
+      oldLine += 1;
+      newLine += 1;
+    }
+  }
+  if (current) blocks.push(current);
+  return blocks;
+}
+
+function countTextLines(value) {
+  if (!value) return 0;
+  const normalized = value.replace(/\r\n/g, "\n");
+  return normalized.split("\n").length - (normalized.endsWith("\n") ? 1 : 0);
+}
+
+async function gitTextFileLineCount(gitRoot, base, relativePath) {
+  const result = await runGit(gitRoot, ["show", base + ":" + relativePath], { allowFailure: true });
+  if (result.code) return null;
+  return countTextLines(result.stdout);
+}
+
+async function workspaceTextFileLineCount(gitRoot, relativePath) {
+  try {
+    const value = await fs.readFile(path.resolve(gitRoot, relativePath), "utf8");
+    return countTextLines(value);
+  } catch {
+    return null;
+  }
+}
+
+async function projectReview(candidate) {
+  const workspacePath = await normalizeWorkspacePath(candidate);
+  const metadata = await fs.stat(workspacePath);
+  if (!metadata.isDirectory()) {
+    const error = new Error("审阅路径必须是目录");
+    error.status = 422;
+    throw error;
+  }
+
+  const { stdout: rootOutput } = await runGit(workspacePath, ["rev-parse", "--show-toplevel"]);
+  const gitRoot = path.resolve(rootOutput.trim());
+  const base = await resolveReviewBase(gitRoot);
+  const scope = path.relative(gitRoot, workspacePath);
+  const scopeArgs = scope ? [scope] : [];
+  const diffArgs = ["diff", "--no-ext-diff", "--no-color", "--find-renames", "--unified=3", base, "--", ...scopeArgs];
+  const { stdout: nameStatusOutput } = await runGit(gitRoot, ["diff", "--name-status", "-z", "--find-renames", base, "--", ...scopeArgs]);
+  const { stdout: diffOutput } = await runGit(gitRoot, diffArgs);
+  const records = parseGitNameStatus(nameStatusOutput);
+  const blocks = parseUnifiedDiff(diffOutput);
+
+  const { stdout: untrackedOutput } = await runGit(gitRoot, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...scopeArgs]);
+  const untrackedPaths = untrackedOutput.split("\0").filter(Boolean);
+  for (const relativePath of untrackedPaths) {
+    const { stdout: untrackedDiff } = await runGit(gitRoot, ["diff", "--no-index", "--no-color", "--unified=3", "--", "/dev/null", relativePath], { allowFailure: true });
+    const parsed = parseUnifiedDiff(untrackedDiff);
+    records.push({ status: "added", oldPath: null, path: relativePath, untracked: true });
+    blocks.push(parsed[0] || { lines: [], binary: false });
+  }
+
+  const files = await Promise.all(records.map(async (record, index) => {
+    const block = blocks[index] || { lines: [], binary: false };
+    const displayPath = path.relative(workspacePath, path.resolve(gitRoot, record.path)) || path.basename(record.path);
+    const additions = block.lines.filter((line) => line.kind === "addition").length;
+    const deletions = block.lines.filter((line) => line.kind === "deletion").length;
+    const oldLineCount = block.binary || record.status === "added"
+      ? (record.status === "added" && !record.untracked
+        ? await gitTextFileLineCount(gitRoot, base, record.oldPath || record.path)
+        : 0)
+      : await gitTextFileLineCount(gitRoot, base, record.oldPath || record.path);
+    const newLineCount = block.binary || record.status === "deleted"
+      ? null
+      : await workspaceTextFileLineCount(gitRoot, record.path);
+    return {
+      path: displayPath,
+      status: record.status,
+      additions,
+      deletions,
+      binary: block.binary,
+      oldLineCount,
+      newLineCount,
+      lines: block.lines,
+    };
+  }));
+
+  return { path: workspacePath, base, files, generatedAt: Date.now() };
 }
 
 async function listAllThreads(archived = false) {
@@ -938,6 +1131,9 @@ async function handle(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/files") {
     return json(res, 200, await fileListing(url.searchParams.get("path")));
   }
+  if (req.method === "GET" && url.pathname === "/api/review") {
+    return json(res, 200, await projectReview(url.searchParams.get("path")));
+  }
   if (req.method === "GET" && url.pathname === "/api/file") {
     return sendFilePreview(res, url.searchParams.get("path"));
   }
@@ -1057,6 +1253,7 @@ async function handle(req, res, url) {
         effort: data.effort || null,
         sandbox: data.sandbox || "workspace-write",
         approvalPolicy: data.approvalPolicy || "on-request",
+        approvalsReviewer: data.approvalsReviewer || "user",
         onAppMessage: (message) => publish(message),
       });
       thread = (await readCliThreadById(threadId)).thread;
@@ -1066,6 +1263,7 @@ async function handle(req, res, url) {
         model: data.model || null,
         sandbox: data.sandbox || "workspace-write",
         approvalPolicy: data.approvalPolicy || "on-request",
+        approvalsReviewer: data.approvalsReviewer || "user",
         personality: data.personality || null,
       };
       const result = await client.request("thread/start", params);
@@ -1080,6 +1278,9 @@ async function handle(req, res, url) {
           input: await inputFrom({ message: data.prompt, files: data.files }),
           model: data.model || null,
           effort: data.effort || null,
+          approvalPolicy: data.approvalPolicy || "on-request",
+          approvalsReviewer: data.approvalsReviewer || "user",
+          sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
         });
         turn = turnResult.turn || turnResult;
       }
@@ -1108,6 +1309,7 @@ async function handle(req, res, url) {
           effort: data.effort || null,
           sandbox: data.sandbox || "workspace-write",
           approvalPolicy: data.approvalPolicy || "on-request",
+          approvalsReviewer: data.approvalsReviewer || "user",
           onAppMessage: (message) => publish(message),
         });
       } else {
@@ -1117,6 +1319,9 @@ async function handle(req, res, url) {
           input: await inputFrom(data),
           model: data.model || null,
           effort: data.effort || null,
+          approvalPolicy: data.approvalPolicy || "on-request",
+          approvalsReviewer: data.approvalsReviewer || "user",
+          sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
         });
         thread = resume?.thread || resume || null;
         turn = turnResult.turn || turnResult;
@@ -1152,6 +1357,9 @@ async function handle(req, res, url) {
           input: await inputFrom({ message: editedMessage, files: data.files }),
           model: data.model || null,
           effort: data.effort || null,
+          approvalPolicy: data.approvalPolicy || "on-request",
+          approvalsReviewer: data.approvalsReviewer || "user",
+          sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
         });
         turn = turnResult.turn || turnResult;
       }

@@ -1,4 +1,6 @@
+import Foundation
 import Combine
+import gitdiff
 import QuickLook
 import SwiftUI
 import WebKit
@@ -185,6 +187,425 @@ struct WorkspaceFilesView: View {
         case "swift", "js", "ts", "json", "html", "css", "py", "sh": return "chevron.left.forwardslash.chevron.right"
         default: return "doc"
         }
+    }
+}
+
+private struct ProjectReviewDisplayItem: Identifiable {
+    let id: String
+    let line: ProjectReviewLine?
+    let hiddenLineCount: Int?
+    let hiddenLineRange: ClosedRange<Int>?
+}
+
+struct ProjectReviewView: View {
+    @EnvironmentObject private var viewModel: AppViewModel
+    let rootPath: String
+
+    @State private var review: ProjectReviewResponse?
+    @State private var isLoading = false
+    @State private var errorText: String?
+    @State private var collapsedFileIDs = Set<String>()
+    @State private var expandedHiddenSegmentIDs = Set<String>()
+    @State private var hiddenLineContents: [String: [ProjectReviewLine]] = [:]
+    @State private var loadingHiddenSegmentIDs = Set<String>()
+    @State private var reviewLoadGeneration = 0
+
+    var body: some View {
+        Group {
+            if rootPath.isEmpty {
+                ContentUnavailableView("没有工作区", systemImage: "folder.badge.questionmark", description: Text("请先选择一个项目或打开带工作目录的对话。"))
+            } else if isLoading && review == nil {
+                ProgressView("读取改动…")
+            } else if let errorText, review == nil {
+                ContentUnavailableView("无法读取审阅内容", systemImage: "exclamationmark.triangle", description: Text(errorText))
+            } else if let review, review.displayableFiles.isEmpty {
+                ContentUnavailableView("没有可显示的文本改动", systemImage: "checkmark.circle", description: Text("二进制文件不会显示，当前没有可展开的文本差异。"))
+            } else if review == nil {
+                VStack(spacing: 10) {
+                    Image(systemName: "arrow.clockwise.circle")
+                        .font(.title2)
+                        .foregroundStyle(.secondary)
+                    Text("审阅暂时不可用")
+                        .font(.headline)
+                    Text("请下拉刷新，或检查服务器连接。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("重新读取") {
+                        Task { await load() }
+                    }
+                    .buttonStyle(.bordered)
+                }
+            } else {
+                reviewContent
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .task(id: rootPath) { await load() }
+        .refreshable { await load() }
+        .alert("无法读取审阅内容", isPresented: Binding(
+            get: { errorText != nil && review != nil },
+            set: { if !$0 { errorText = nil } }
+        )) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(errorText ?? "未知错误")
+        }
+    }
+
+    @ViewBuilder
+    private var reviewContent: some View {
+        if let review {
+            let files = review.displayableFiles
+            let totalAdditions = files.reduce(0) { $0 + $1.additions }
+            let totalDeletions = files.reduce(0) { $0 + $1.deletions }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "arrow.triangle.branch")
+                            .foregroundStyle(.secondary)
+                        Text("相对 \(review.base)")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text("\(files.count) 个文件")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                        Text("+\(totalAdditions)")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.green)
+                        Text("-\(totalDeletions)")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.red)
+                    }
+
+                    ForEach(Array(files.enumerated()), id: \.offset) { index, file in
+                        reviewFile(file, identity: "\(index)-\(file.path)")
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+            }
+            .scrollDismissesKeyboard(.interactively)
+        }
+    }
+
+    private func reviewFile(_ file: ProjectReviewFile, identity: String) -> some View {
+        let isCollapsed = collapsedFileIDs.contains(identity)
+
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: statusIcon(file.status))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(statusColor(file.status))
+                Text(file.path)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+                Spacer(minLength: 4)
+                Text("+\(file.additions)")
+                    .foregroundStyle(.green)
+                Text("-\(file.deletions)")
+                    .foregroundStyle(.red)
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        if isCollapsed {
+                            collapsedFileIDs.remove(identity)
+                        } else {
+                            collapsedFileIDs.insert(identity)
+                        }
+                    }
+                } label: {
+                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                        .font(.caption.weight(.semibold))
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(isCollapsed ? "展开文件差异" : "收起文件差异")
+            }
+            .font(.caption2.monospacedDigit())
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(Color(.tertiarySystemBackground))
+
+            if !isCollapsed {
+                if file.lines.isEmpty {
+                    Text(statusTitle(file.status))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(12)
+                } else {
+                    ForEach(displayItems(for: file, identity: identity)) { item in
+                        if let line = item.line {
+                            CodexDiffLineRow(line: makeDiffLine(line))
+                        } else if let hiddenLineCount = item.hiddenLineCount,
+                                  let hiddenLineRange = item.hiddenLineRange {
+                            if expandedHiddenSegmentIDs.contains(item.id),
+                               let expandedLines = hiddenLineContents[item.id] {
+                                ForEach(expandedLines) { line in
+                                    CodexDiffLineRow(line: makeDiffLine(line))
+                                }
+                            } else {
+                                Button {
+                                    expandHiddenSegment(
+                                        item,
+                                        file: file,
+                                        range: hiddenLineRange
+                                    )
+                                } label: {
+                                    HStack(spacing: 6) {
+                                        if loadingHiddenSegmentIDs.contains(item.id) {
+                                            ProgressView()
+                                                .controlSize(.small)
+                                        } else {
+                                            Image(systemName: "ellipsis")
+                                        }
+                                        Text(loadingHiddenSegmentIDs.contains(item.id)
+                                             ? "正在读取 \(hiddenLineCount) 行"
+                                             : "\(hiddenLineCount) 行隐藏，点击展开")
+                                    }
+                                    .font(.caption2.weight(.medium))
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.leading, 54)
+                                    .padding(.vertical, 6)
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(loadingHiddenSegmentIDs.contains(item.id))
+                                .background(Color(.secondarySystemBackground).opacity(0.7))
+                                .accessibilityLabel("展开隐藏的 \(hiddenLineCount) 行")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color(.separator).opacity(0.45), lineWidth: 0.6)
+        }
+    }
+
+    private func displayItems(for file: ProjectReviewFile, identity: String) -> [ProjectReviewDisplayItem] {
+        let lines = file.lines
+        guard !lines.isEmpty else { return [] }
+        let changedIndexes = lines.indices.filter { index in
+            lines[index].kind == "addition" || lines[index].kind == "deletion"
+        }
+        var ranges: [ClosedRange<Int>] = []
+        for index in changedIndexes {
+            let proposed = max(lines.startIndex, index - 1)...min(lines.index(before: lines.endIndex), index + 1)
+            if let last = ranges.last, proposed.lowerBound <= last.upperBound + 1 {
+                ranges[ranges.count - 1] = last.lowerBound...max(last.upperBound, proposed.upperBound)
+            } else {
+                ranges.append(proposed)
+            }
+        }
+
+        if ranges.isEmpty {
+            let lastIndex = min(lines.count - 1, 1)
+            var items = (0...lastIndex).map { index in
+                ProjectReviewDisplayItem(
+                    id: "\(identity)-line-\(index)",
+                    line: lines[index],
+                    hiddenLineCount: nil,
+                    hiddenLineRange: nil
+                )
+            }
+            if let hiddenRange = hiddenLineRange(after: lines[lastIndex], in: file) {
+                items.append(ProjectReviewDisplayItem(
+                    id: "\(identity)-hidden-0",
+                    line: nil,
+                    hiddenLineCount: hiddenRange.count,
+                    hiddenLineRange: hiddenRange
+                ))
+            }
+            return items
+        }
+
+        var items: [ProjectReviewDisplayItem] = []
+        var hiddenIndex = 0
+        var lastVisibleLine: ProjectReviewLine?
+
+        for range in ranges {
+            let firstLine = lines[range.lowerBound]
+            let hiddenRange: ClosedRange<Int>?
+            if let lastVisibleLine {
+                let start = diffLineNumber(lastVisibleLine) + 1
+                let end = diffLineNumber(firstLine) - 1
+                hiddenRange = start <= end ? start...end : nil
+            } else {
+                let end = diffLineNumber(firstLine) - 1
+                hiddenRange = end > 0 ? 1...end : nil
+            }
+            if let hiddenRange {
+                items.append(ProjectReviewDisplayItem(
+                    id: "\(identity)-hidden-\(hiddenIndex)",
+                    line: nil,
+                    hiddenLineCount: hiddenRange.count,
+                    hiddenLineRange: hiddenRange
+                ))
+                hiddenIndex += 1
+            }
+
+            for index in range {
+                items.append(ProjectReviewDisplayItem(
+                    id: "\(identity)-line-\(index)",
+                    line: lines[index],
+                    hiddenLineCount: nil,
+                    hiddenLineRange: nil
+                ))
+            }
+            lastVisibleLine = lines[range.upperBound]
+        }
+
+        if let lastVisibleLine {
+            if let hiddenRange = hiddenLineRange(after: lastVisibleLine, in: file) {
+                items.append(ProjectReviewDisplayItem(
+                    id: "\(identity)-hidden-\(hiddenIndex)",
+                    line: nil,
+                    hiddenLineCount: hiddenRange.count,
+                    hiddenLineRange: hiddenRange
+                ))
+            }
+        }
+        return items
+    }
+
+    private func diffLineNumber(_ line: ProjectReviewLine) -> Int {
+        max(line.lineNumber, 1)
+    }
+
+    private func hiddenLineRange(after line: ProjectReviewLine, in file: ProjectReviewFile) -> ClosedRange<Int>? {
+        let lineNumber = diffLineNumber(line)
+        let totalLineCount = line.kind == "deletion"
+            ? (file.oldLineCount ?? lineNumber)
+            : (file.newLineCount ?? lineNumber)
+        let start = lineNumber + 1
+        guard start <= totalLineCount else { return nil }
+        return start...totalLineCount
+    }
+
+    private func expandHiddenSegment(
+        _ item: ProjectReviewDisplayItem,
+        file: ProjectReviewFile,
+        range: ClosedRange<Int>
+    ) {
+        guard !loadingHiddenSegmentIDs.contains(item.id) else { return }
+        if hiddenLineContents[item.id] != nil {
+            _ = withAnimation(.easeInOut(duration: 0.2)) {
+                expandedHiddenSegmentIDs.insert(item.id)
+            }
+            return
+        }
+
+        loadingHiddenSegmentIDs.insert(item.id)
+        Task { @MainActor in
+            do {
+                let filePath = (rootPath as NSString).appendingPathComponent(file.path)
+                let data = try await viewModel.previewFile(path: filePath)
+                guard let source = CodePreviewFile.decode(data) else {
+                    throw NSError(
+                        domain: "CloudexReview",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "无法读取隐藏行内容"]
+                    )
+                }
+                let normalized = source
+                    .replacingOccurrences(of: "\r\n", with: "\n")
+                    .replacingOccurrences(of: "\r", with: "\n")
+                var sourceLines = normalized.components(separatedBy: "\n")
+                if sourceLines.last == "" { sourceLines.removeLast() }
+                let expandedLines = range.compactMap { lineNumber -> ProjectReviewLine? in
+                    guard lineNumber >= 1,
+                          lineNumber <= sourceLines.count else { return nil }
+                    return ProjectReviewLine(
+                        kind: "context",
+                        text: sourceLines[lineNumber - 1],
+                        lineNumber: lineNumber
+                    )
+                }
+                hiddenLineContents[item.id] = expandedLines
+                _ = withAnimation(.easeInOut(duration: 0.2)) {
+                    expandedHiddenSegmentIDs.insert(item.id)
+                }
+            } catch {
+                if !Task.isCancelled && !isCancellationError(error) {
+                    errorText = error.localizedDescription
+                }
+            }
+            loadingHiddenSegmentIDs.remove(item.id)
+        }
+    }
+
+    private func makeDiffLine(_ line: ProjectReviewLine) -> DiffLine {
+        switch line.kind {
+        case "addition":
+            return DiffLine(type: .added, content: line.text, oldLineNumber: nil, newLineNumber: line.lineNumber)
+        case "deletion":
+            return DiffLine(type: .removed, content: line.text, oldLineNumber: line.lineNumber, newLineNumber: nil)
+        default:
+            return DiffLine(type: .context, content: line.text, oldLineNumber: line.lineNumber, newLineNumber: line.lineNumber)
+        }
+    }
+
+    private func statusTitle(_ status: String) -> String {
+        switch status {
+        case "added": return "新增文件"
+        case "deleted": return "文件已删除"
+        case "renamed": return "文件已重命名"
+        default: return "文件已修改"
+        }
+    }
+
+    private func statusIcon(_ status: String) -> String {
+        switch status {
+        case "added": return "plus"
+        case "deleted": return "minus"
+        case "renamed": return "arrow.right"
+        default: return "pencil"
+        }
+    }
+
+    private func statusColor(_ status: String) -> Color {
+        switch status {
+        case "added": return .green
+        case "deleted": return .red
+        case "renamed": return .orange
+        default: return .blue
+        }
+    }
+
+    private func load() async {
+        guard !rootPath.isEmpty else { return }
+        reviewLoadGeneration += 1
+        let generation = reviewLoadGeneration
+        isLoading = true
+        errorText = nil
+        expandedHiddenSegmentIDs.removeAll()
+        hiddenLineContents.removeAll()
+        loadingHiddenSegmentIDs.removeAll()
+        do {
+            review = try await viewModel.loadProjectReview(path: rootPath)
+        } catch {
+            guard generation == reviewLoadGeneration else { return }
+            if Task.isCancelled || isCancellationError(error) {
+                isLoading = false
+                return
+            }
+            errorText = error.localizedDescription
+            if review == nil { review = nil }
+        }
+        guard generation == reviewLoadGeneration else { return }
+        isLoading = false
+    }
+
+    private func isCancellationError(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        if let urlError = error as? URLError, urlError.code == .cancelled { return true }
+        return (error as NSError).code == NSURLErrorCancelled
     }
 }
 

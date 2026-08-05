@@ -5,11 +5,13 @@ import UIKit
 private enum ConversationSubpage: Hashable {
     case conversation
     case files
-    case browser
+    case review
 }
 
 struct ContentView: View {
     @EnvironmentObject private var viewModel: AppViewModel
+    @Environment(\.cloudexIsWindowedIPad) private var isWindowedIPad
+    @Environment(\.cloudexBottomSafeArea) private var bottomSafeArea
     @StateObject private var chatScrollController = ChatScrollController()
     let expectedThreadID: String?
     let onToggleDirectory: (() -> Void)?
@@ -29,6 +31,7 @@ struct ContentView: View {
     @State private var isMessagePositioningInProgress = false
     @State private var isProcessLayoutChangeInProgress = false
     @State private var processLayoutGeneration = 0
+    @State private var processExpansionScrollOffset: CGPoint?
     @State private var isUserScrollingChat = false
     @State private var messageJumpSnapshot: [MessageJumpItem] = []
     @State private var scrollTargetMessageID: String?
@@ -128,9 +131,26 @@ struct ContentView: View {
             .animation(.easeInOut(duration: 0.18), value: isFollowingChatBottom)
         }
         .ignoresSafeArea(.keyboard, edges: .top)
-        .navigationTitle(viewModel.navigationTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                VStack(spacing: 1) {
+                    Text(viewModel.navigationTitle)
+                        .font(.headline)
+                        .lineLimit(1)
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(viewModel.isConnected ? Color.green : Color.red)
+                            .frame(width: 7, height: 7)
+                        Text(viewModel.isConnected ? "已连接" : "未连接")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(viewModel.isConnected ? "已连接" : "未连接")
+                }
+                .frame(maxWidth: 220)
+            }
             if showsDirectoryButton {
                 if let onToggleDirectory {
                     ToolbarItem(placement: .topBarTrailing) {
@@ -139,7 +159,7 @@ struct ContentView: View {
                                 .frame(width: 44, height: 44)
                                 .contentShape(Rectangle())
                         }
-                        .accessibilityLabel("打开对话目录")
+                        .accessibilityLabel("打开侧边面板")
                     }
                 } else {
                     ToolbarItem(placement: .topBarTrailing) {
@@ -150,7 +170,7 @@ struct ContentView: View {
                                 .frame(width: 44, height: 44)
                                 .contentShape(Rectangle())
                         }
-                        .accessibilityLabel("打开对话目录")
+                        .accessibilityLabel("打开侧边面板")
                     }
                 }
             }
@@ -177,9 +197,19 @@ struct ContentView: View {
                     onSelect: { showMessage($0.id) }
                 )
                 .environmentObject(viewModel)
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            showingMessageDirectory = false
+                        } label: {
+                            Image(systemName: "xmark")
+                        }
+                        .accessibilityLabel("关闭侧边面板")
+                    }
+                }
             }
-            .presentationDetents([.large])
-            .presentationDragIndicator(.visible)
+            .interactiveDismissDisabled(true)
+            .presentationDragIndicator(.hidden)
         }
         .onChange(of: viewModel.messageIndex, initial: true) { _, items in
             // A native Menu loses its internal scroll position whenever its
@@ -337,8 +367,11 @@ struct ContentView: View {
                             onFork: {
                                 await viewModel.forkAssistantMessage(message)
                             },
-                            onProcessInteraction: {
-                                beginProcessLayoutChange()
+                            onProcessInteraction: { isExpanding in
+                                beginProcessLayoutChange(expanding: isExpanding, restorePosition: false)
+                            },
+                            onFloatingProcessCollapse: {
+                                beginProcessLayoutChange(expanding: false, restorePosition: true)
                             },
                             onFloatingStateChange: { visible in
                                 floatingCollapseVisible = visible
@@ -509,66 +542,91 @@ struct ContentView: View {
 
             HStack(spacing: 7) {
                 Menu {
-                    if viewModel.models.isEmpty {
-                        Button {
-                            Task { await viewModel.loadModelsIfNeeded(force: true) }
-                        } label: {
-                            Label("读取模型列表", systemImage: "arrow.clockwise")
-                        }
-                    } else {
-                        Picker("模型", selection: Binding(
-                            get: { viewModel.selectedModelID },
-                            set: { viewModel.selectModel($0) }
-                        )) {
-                            ForEach(viewModel.models, id: \.identifier) { model in
-                                Text(model.title).tag(model.identifier)
+                    Button {
+                        Task { await viewModel.loadModelsIfNeeded(force: true) }
+                    } label: {
+                        Label("刷新", systemImage: "arrow.clockwise")
+                    }
+
+                    Menu {
+                        if viewModel.models.isEmpty {
+                            Button {
+                                Task { await viewModel.loadModelsIfNeeded(force: true) }
+                            } label: {
+                                Label("读取模型列表", systemImage: "arrow.clockwise")
+                            }
+                        } else {
+                            Picker("选择模型", selection: Binding(
+                                get: { viewModel.selectedModelID },
+                                set: { viewModel.selectModel($0) }
+                            )) {
+                                ForEach(viewModel.models, id: \.identifier) { model in
+                                    Text(model.title).tag(model.identifier)
+                                }
                             }
                         }
+                    } label: {
+                        Label("模型", systemImage: "cpu")
+                    }
 
-                        Divider()
-
-                        Button {
-                            Task { await viewModel.loadModelsIfNeeded(force: true) }
-                        } label: {
-                            Label("刷新模型列表", systemImage: "arrow.clockwise")
+                    Menu {
+                        if viewModel.availableEfforts.isEmpty {
+                            Text("默认")
+                        } else {
+                            Picker("选择用量", selection: Binding(
+                                get: { viewModel.selectedEffortID },
+                                set: { viewModel.selectEffort($0) }
+                            )) {
+                                ForEach(viewModel.availableEfforts) { effort in
+                                    Text(effort.title).tag(effort.reasoningEffort)
+                                }
+                            }
                         }
+                    } label: {
+                        Label("用量", systemImage: "gauge.with.dots.needle.67percent")
                     }
                 } label: {
-                    Text(viewModel.compactModelTitle)
-                        .lineLimit(1)
-                        .font(.caption.weight(.medium))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .contentShape(Capsule())
+                    HStack(spacing: 5) {
+                        Text(viewModel.compactModelTitle)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text("·")
+                            .foregroundStyle(.secondary)
+                        Text(viewModel.selectedEffortTitle)
+                            .lineLimit(1)
+                    }
+                    .font(.caption.weight(.medium))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
                 .liquidGlass(in: Capsule(), interactive: true)
-                .accessibilityLabel("切换模型")
+                .accessibilityLabel("切换模型和用量")
 
                 Menu {
-                    if viewModel.availableEfforts.isEmpty {
-                        Text("默认")
-                    } else {
-                        Picker("用量", selection: Binding(
-                            get: { viewModel.selectedEffortID },
-                            set: { viewModel.selectEffort($0) }
-                        )) {
-                            ForEach(viewModel.availableEfforts) { effort in
-                                Text(effort.title).tag(effort.reasoningEffort)
-                            }
+                    Picker("模式", selection: Binding(
+                        get: { viewModel.codexMode },
+                        set: { viewModel.selectCodexMode($0) }
+                    )) {
+                        ForEach(CodexExecutionMode.allCases) { mode in
+                            Label(mode.title, systemImage: mode.systemImage)
+                                .tag(mode)
                         }
                     }
                 } label: {
-                    Text("用量 \(viewModel.selectedEffortTitle)")
-                        .lineLimit(1)
+                    Label(viewModel.codexMode.title, systemImage: viewModel.codexMode.systemImage)
                         .font(.caption.weight(.medium))
+                        .lineLimit(1)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
+                        .fixedSize(horizontal: true, vertical: false)
                         .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
                 .liquidGlass(in: Capsule(), interactive: true)
-                .accessibilityLabel("切换用量")
+                .accessibilityLabel("切换执行模式")
 
                 Spacer(minLength: 0)
 
@@ -675,10 +733,9 @@ struct ContentView: View {
 
     private var bottomControlPadding: CGFloat {
         if keyboardHeight > 0 { return 18 }
-        // The negative inset visually balances the taller iPhone home-indicator
-        // safe area. In an iPad window the system edge inset is already small,
-        // so subtracting from it makes the composer touch the window border.
-        return UIDevice.current.userInterfaceIdiom == .pad ? 0 : -7
+        guard UIDevice.current.userInterfaceIdiom == .pad else { return -7 }
+        guard isWindowedIPad else { return 0 }
+        return max(0, 24 - bottomSafeArea)
     }
 
     private var isExpectedChatReady: Bool {
@@ -783,6 +840,7 @@ struct ContentView: View {
         isInitialBottomScrollInProgress = false
         isMessagePositioningInProgress = false
         isProcessLayoutChangeInProgress = false
+        processExpansionScrollOffset = nil
         isAtChatBottom = true
         isFollowingChatBottom = true
         isUserScrollingChat = false
@@ -839,12 +897,27 @@ struct ContentView: View {
         }
     }
 
-    private func beginProcessLayoutChange() {
+    private func beginProcessLayoutChange(expanding: Bool, restorePosition: Bool) {
         processLayoutGeneration += 1
         let generation = processLayoutGeneration
         chatScrollController.cancelCurrentScroll()
         isFollowingChatBottom = false
         isProcessLayoutChangeInProgress = true
+
+        if expanding {
+            processExpansionScrollOffset = chatScrollController.currentContentOffset()
+        } else if restorePosition, let offset = processExpansionScrollOffset {
+            processExpansionScrollOffset = nil
+            let restoreSavedPosition = {
+                guard processLayoutGeneration == generation else { return }
+                _ = chatScrollController.restoreContentOffset(offset)
+            }
+            DispatchQueue.main.async(execute: restoreSavedPosition)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: restoreSavedPosition)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: restoreSavedPosition)
+        } else {
+            processExpansionScrollOffset = nil
+        }
 
         // Long histories need several LazyVStack layout passes. During that
         // window, do not interpret content-height changes as a reason to
@@ -1022,6 +1095,27 @@ private final class ChatScrollController: ObservableObject {
                 + scrollView.adjustedContentInset.bottom
         )
         return maximumY - scrollView.contentOffset.y <= tolerance
+    }
+
+    func currentContentOffset() -> CGPoint? {
+        guard let scrollView, scrollView.window != nil else { return nil }
+        return scrollView.contentOffset
+    }
+
+    @discardableResult
+    func restoreContentOffset(_ offset: CGPoint) -> Bool {
+        guard let scrollView, scrollView.window != nil else { return false }
+        scrollView.layoutIfNeeded()
+        let minimumY = -scrollView.adjustedContentInset.top
+        let maximumY = max(
+            minimumY,
+            scrollView.contentSize.height
+                - scrollView.bounds.height
+                + scrollView.adjustedContentInset.bottom
+        )
+        let targetY = min(max(offset.y, minimumY), maximumY)
+        scrollView.setContentOffset(CGPoint(x: offset.x, y: targetY), animated: false)
+        return true
     }
 
     @discardableResult
@@ -1258,7 +1352,8 @@ private struct MessageBubble: View {
     @Binding var collapseRequest: Int
     let onQuickFill: (String) -> Void
     let onFork: () async -> Bool
-    let onProcessInteraction: () -> Void
+    let onProcessInteraction: (Bool) -> Void
+    let onFloatingProcessCollapse: () -> Void
     let onFloatingStateChange: (Bool) -> Void
     @State private var isPerformingAction = false
 
@@ -1271,6 +1366,7 @@ private struct MessageBubble: View {
                 message: message,
                 collapseRequest: $collapseRequest,
                 onInteraction: onProcessInteraction,
+                onFloatingCollapse: onFloatingProcessCollapse,
                 onFloatingStateChange: onFloatingStateChange
             )
         } else if message.role == .taskSummary || message.role == .compressed || message.role == .system {
@@ -1394,7 +1490,8 @@ private struct ProcessSummaryBubble: View {
     @EnvironmentObject private var viewModel: AppViewModel
     let message: ChatMessage
     @Binding var collapseRequest: Int
-    let onInteraction: () -> Void
+    let onInteraction: (Bool) -> Void
+    let onFloatingCollapse: () -> Void
     let onFloatingStateChange: (Bool) -> Void
     @State private var expanded = false
     @State private var expansionGeneration = 0
@@ -1407,11 +1504,12 @@ private struct ProcessSummaryBubble: View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 8) {
                 Button {
-                    onInteraction()
                     if expanded {
+                        onInteraction(false)
                         expanded = false
                         expansionGeneration += 1
                     } else if message.processDetailsLoaded {
+                        onInteraction(true)
                         expanded = true
                     } else if let turnID = message.sourceTurnID, !loadingDetails {
                         loadingDetails = true
@@ -1419,7 +1517,7 @@ private struct ProcessSummaryBubble: View {
                             let loaded = await viewModel.loadTurnDetails(turnID: turnID)
                             loadingDetails = false
                             if loaded {
-                                onInteraction()
+                                onInteraction(true)
                                 expanded = true
                             }
                         }
@@ -1521,7 +1619,7 @@ private struct ProcessSummaryBubble: View {
         }
         .onChange(of: collapseRequest) { _, _ in
             guard expanded else { return }
-            onInteraction()
+            onFloatingCollapse()
             expanded = false
             expansionGeneration += 1
             onFloatingStateChange(false)
@@ -1578,27 +1676,21 @@ private struct SystemTimelineBubble: View {
 
     var body: some View {
         HStack {
-            Spacer(minLength: 28)
-            VStack(spacing: 4) {
-                HStack(spacing: 6) {
-                    Image(systemName: iconName)
-                    MarkdownText(text: message.text)
-                }
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(foregroundColor)
-                .multilineTextAlignment(.center)
-                let time = DateFormatting.messageTime(from: message.createdAt)
-                if !time.isEmpty {
-                    Text(time)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
+            Spacer(minLength: 0)
+            HStack(spacing: 6) {
+                Image(systemName: iconName)
+                Text(message.text)
+                    .lineLimit(1)
             }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(foregroundColor)
+            .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(Color(.tertiarySystemBackground), in: Capsule())
-            Spacer(minLength: 28)
+            Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity, alignment: .center)
     }
 
     private var iconName: String {
@@ -1615,23 +1707,242 @@ private struct MarkdownText: View {
     var highlightQuery: String? = nil
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            ForEach(Array(text.replacingOccurrences(of: "\r\n", with: "\n").split(separator: "\n", omittingEmptySubsequences: false).enumerated()), id: \.offset) { _, line in
-                let value = String(line)
-                if value.isEmpty {
-                    Color.clear.frame(height: 5)
-                } else {
-                    Text(Self.parseLine(value, highlightQuery: highlightQuery))
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Self.blocks(from: text)) { block in
+                switch block.content {
+                case let .paragraph(value):
+                    Text(Self.parseInline(value, highlightQuery: highlightQuery))
                         .frame(maxWidth: .infinity, alignment: .leading)
+                case let .code(value, language):
+                    MarkdownCodeBlock(source: value, language: language)
+                case let .table(rows):
+                    MarkdownTableView(rows: rows, highlightQuery: highlightQuery)
                 }
             }
         }
         .fixedSize(horizontal: false, vertical: true)
     }
 
-    private static func parseLine(_ text: String, highlightQuery: String?) -> AttributedString {
+    private static func parseInline(_ text: String, highlightQuery: String?) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
         let parsed = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        return highlightedAttributedString(parsed, query: highlightQuery)
+    }
+
+    private static func blocks(from source: String) -> [MarkdownBlock] {
+        let lines = source
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        var blocks: [MarkdownBlock] = []
+        var paragraph: [String] = []
+        var index = 0
+        var blockID = 0
+
+        func appendBlock(_ content: MarkdownBlock.Content) {
+            blocks.append(MarkdownBlock(id: blockID, content: content))
+            blockID += 1
+        }
+
+        func flushParagraph() {
+            let value = paragraph.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !value.isEmpty {
+                appendBlock(.paragraph(value))
+            }
+            paragraph.removeAll(keepingCapacity: true)
+        }
+
+        while index < lines.count {
+            let line = lines[index]
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            if let language = Self.fenceLanguage(in: trimmed) {
+                flushParagraph()
+                index += 1
+                var codeLines: [String] = []
+                while index < lines.count {
+                    let codeLine = lines[index]
+                    if codeLine.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                        index += 1
+                        break
+                    }
+                    codeLines.append(codeLine)
+                    index += 1
+                }
+                appendBlock(.code(codeLines.joined(separator: "\n"), language))
+                continue
+            }
+
+            if index + 1 < lines.count,
+               trimmed.contains("|"),
+               Self.isTableSeparator(lines[index + 1]) {
+                flushParagraph()
+                var rows = [Self.tableRow(from: line)]
+                index += 2
+                while index < lines.count {
+                    let row = lines[index]
+                    let rowTrimmed = row.trimmingCharacters(in: .whitespaces)
+                    guard !rowTrimmed.isEmpty, rowTrimmed.contains("|") else { break }
+                    rows.append(Self.tableRow(from: row))
+                    index += 1
+                }
+                if rows.first?.count ?? 0 > 0 {
+                    appendBlock(.table(rows))
+                }
+                continue
+            }
+
+            if Self.isIndentedCode(line) {
+                flushParagraph()
+                var codeLines: [String] = []
+                while index < lines.count {
+                    let codeLine = lines[index]
+                    if codeLine.isEmpty {
+                        codeLines.append("")
+                        index += 1
+                    } else if Self.isIndentedCode(codeLine) {
+                        let indentation = codeLine.hasPrefix("\t") ? 1 : min(4, codeLine.count)
+                        codeLines.append(String(codeLine.dropFirst(indentation)))
+                        index += 1
+                    } else {
+                        break
+                    }
+                }
+                while codeLines.last?.isEmpty == true { codeLines.removeLast() }
+                appendBlock(.code(codeLines.joined(separator: "\n"), ""))
+                continue
+            }
+
+            if trimmed.isEmpty {
+                flushParagraph()
+            } else {
+                paragraph.append(line)
+            }
+            index += 1
+        }
+        flushParagraph()
+        return blocks
+    }
+
+    private static func fenceLanguage(in line: String) -> String? {
+        guard line.hasPrefix("```") else { return nil }
+        return String(line.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func isIndentedCode(_ line: String) -> Bool {
+        line.hasPrefix("    ") || line.hasPrefix("\t")
+    }
+
+    private static func isTableSeparator(_ line: String) -> Bool {
+        let cells = tableRow(from: line)
+        guard cells.count >= 2 else { return false }
+        return cells.allSatisfy { cell in
+            let value = cell.trimmingCharacters(in: .whitespaces)
+            let withoutEdges = value.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+            return withoutEdges.count >= 3 && withoutEdges.allSatisfy { $0 == "-" }
+        }
+    }
+
+    private static func tableRow(from line: String) -> [String] {
+        var value = line.trimmingCharacters(in: .whitespaces)
+        if value.hasPrefix("|") { value.removeFirst() }
+        if value.hasSuffix("|") { value.removeLast() }
+
+        var cells: [String] = []
+        var current = ""
+        var escaped = false
+        for character in value {
+            if character == "|" && !escaped {
+                cells.append(current.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\\|", with: "|"))
+                current = ""
+            } else {
+                current.append(character)
+            }
+            escaped = character == "\\" && !escaped
+        }
+        cells.append(current.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\\|", with: "|"))
+        return cells
+    }
+}
+
+private struct MarkdownBlock: Identifiable {
+    enum Content {
+        case paragraph(String)
+        case code(String, String)
+        case table([[String]])
+    }
+
+    let id: Int
+    let content: Content
+}
+
+private struct MarkdownCodeBlock: View {
+    let source: String
+    let language: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if !language.isEmpty {
+                Text(language.lowercased())
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(source.isEmpty ? " " : source)
+                    .font(.system(.callout, design: .monospaced))
+                    .lineSpacing(2)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: true, vertical: true)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+private struct MarkdownTableView: View {
+    let rows: [[String]]
+    let highlightQuery: String?
+
+    var body: some View {
+        let columnCount = rows.map(\.count).max() ?? 0
+        ScrollView(.horizontal, showsIndicators: false) {
+            Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
+                ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
+                    GridRow {
+                        ForEach(0..<columnCount, id: \.self) { column in
+                            Text(inlineText(row.indices.contains(column) ? row[column] : ""))
+                                .font(.subheadline)
+                                .foregroundStyle(.primary)
+                                .multilineTextAlignment(.leading)
+                                .frame(minWidth: 110, maxWidth: 220, alignment: .leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 8)
+                                .background(rowIndex == 0 ? Color(.secondarySystemBackground) : Color(.tertiarySystemBackground))
+                                .overlay {
+                                    Rectangle().stroke(Color.secondary.opacity(0.18), lineWidth: 0.5)
+                                }
+                        }
+                    }
+                }
+            }
+            .padding(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func inlineText(_ value: String) -> AttributedString {
+        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
+        let parsed = (try? AttributedString(markdown: value, options: options)) ?? AttributedString(value)
         return highlightedAttributedString(parsed, query: highlightQuery)
     }
 }
@@ -1966,7 +2277,7 @@ private struct CodexStyleDiffRenderer: View {
     }
 }
 
-private struct CodexDiffLineRow: View {
+struct CodexDiffLineRow: View {
     let line: DiffLine
 
     var body: some View {
@@ -2247,8 +2558,8 @@ private struct MessageJumpListView: View {
                     .tag(ConversationSubpage.conversation)
                 Label("文件", systemImage: "folder")
                     .tag(ConversationSubpage.files)
-                Label("浏览器", systemImage: "safari")
-                    .tag(ConversationSubpage.browser)
+                Label("审阅", systemImage: "doc.text.magnifyingglass")
+                    .tag(ConversationSubpage.review)
             }
             .pickerStyle(.segmented)
             .padding(.horizontal, 16)
@@ -2268,10 +2579,12 @@ private struct MessageJumpListView: View {
                     .allowsHitTesting(selectedSubpage == .files)
                     .accessibilityHidden(selectedSubpage != .files)
 
-                WorkspaceBrowserView()
-                    .opacity(selectedSubpage == .browser ? 1 : 0)
-                    .allowsHitTesting(selectedSubpage == .browser)
-                    .accessibilityHidden(selectedSubpage != .browser)
+                ProjectReviewView(rootPath: workspaceRoot)
+                    .environmentObject(viewModel)
+                    .id(workspaceRoot)
+                    .opacity(selectedSubpage == .review ? 1 : 0)
+                    .allowsHitTesting(selectedSubpage == .review)
+                    .accessibilityHidden(selectedSubpage != .review)
             }
         }
         .modifier(DirectoryNavigationChromeModifier(
@@ -2359,7 +2672,7 @@ private struct DirectoryNavigationChromeModifier: ViewModifier {
     func body(content: Content) -> some View {
         if isVisible {
             content
-                .navigationTitle("对话目录")
+                .navigationTitle("侧边面板")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     if let onExpand {
@@ -2367,7 +2680,7 @@ private struct DirectoryNavigationChromeModifier: ViewModifier {
                             Button(action: onExpand) {
                                 Image(systemName: "arrow.up.left.and.arrow.down.right")
                             }
-                            .accessibilityLabel("打开对话目录页面")
+                            .accessibilityLabel("打开侧边面板页面")
                         }
                     }
                 }

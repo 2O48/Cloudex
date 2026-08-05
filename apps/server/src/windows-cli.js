@@ -262,6 +262,7 @@ export function buildCliArgs({
   effort = null,
   sandbox = null,
   approvalPolicy = null,
+  approvalsReviewer = null,
 } = {}) {
   const args = resume ? ["exec", "resume", "--json"] : ["exec", "--json"];
   if (resume) {
@@ -273,6 +274,7 @@ export function buildCliArgs({
   if (effort) args.push("-c", `model_reasoning_effort="${effort}"`);
   if (sandbox) args.push("-c", `sandbox_mode="${sandbox}"`);
   if (approvalPolicy) args.push("-c", `approval_policy="${approvalPolicy}"`);
+  if (approvalsReviewer) args.push("-c", `approvals_reviewer="${approvalsReviewer}"`);
   for (const file of files) {
     const filePath = typeof file === "string" ? file : file?.path;
     if (filePath) args.push("-i", filePath);
@@ -370,6 +372,7 @@ export async function startNewThread({
   effort = null,
   sandbox = null,
   approvalPolicy = null,
+  approvalsReviewer = null,
   onAppMessage = null,
 } = {}) {
   if (!prompt) {
@@ -387,6 +390,7 @@ export async function startNewThread({
     effort,
     sandbox,
     approvalPolicy,
+    approvalsReviewer,
   });
   let turnPromise = null;
   const bridge = createExecEventBridge(onAppMessage, (turnThreadId) => {
@@ -423,6 +427,7 @@ export async function resumeThread({
   effort = null,
   sandbox = null,
   approvalPolicy = null,
+  approvalsReviewer = null,
   onAppMessage = null,
 } = {}) {
   let detail;
@@ -441,6 +446,7 @@ export async function resumeThread({
     effort,
     sandbox,
     approvalPolicy,
+    approvalsReviewer,
   });
   let turnPromise = null;
   const bridge = createExecEventBridge(onAppMessage, (turnThreadId) => {

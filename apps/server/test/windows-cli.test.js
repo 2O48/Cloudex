@@ -20,6 +20,7 @@ test("windows CLI args resume an existing session with model, effort, and images
     effort: "high",
     sandbox: "workspace-write",
     approvalPolicy: "on-request",
+    approvalsReviewer: "auto_review",
   });
   assert.deepEqual(args, [
     "exec",
@@ -34,6 +35,8 @@ test("windows CLI args resume an existing session with model, effort, and images
     'sandbox_mode="workspace-write"',
     "-c",
     'approval_policy="on-request"',
+    "-c",
+    'approvals_reviewer="auto_review"',
     "-i",
     "C:\\tmp\\screenshot.png",
     "继续检查日志",

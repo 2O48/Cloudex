@@ -1,6 +1,26 @@
 import Foundation
 import SwiftUI
 
+private struct CloudexIPadWindowedKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+private struct CloudexBottomSafeAreaKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 0
+}
+
+extension EnvironmentValues {
+    var cloudexIsWindowedIPad: Bool {
+        get { self[CloudexIPadWindowedKey.self] }
+        set { self[CloudexIPadWindowedKey.self] = newValue }
+    }
+
+    var cloudexBottomSafeArea: CGFloat {
+        get { self[CloudexBottomSafeAreaKey.self] }
+        set { self[CloudexBottomSafeAreaKey.self] = newValue }
+    }
+}
+
 struct MessageTextHighlight: Equatable {
     let messageID: String
     let query: String
@@ -45,6 +65,58 @@ enum ConnectionMode: String, CaseIterable, Identifiable, Codable {
         case .automatic: return "自动"
         case .lan: return "局域网"
         case .tailscale: return "Tailscale"
+        }
+    }
+}
+
+enum CodexExecutionMode: String, CaseIterable, Identifiable, Codable {
+    case requestApproval
+    case approveForMe
+    case fullAccess
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .requestApproval: return "请求批准"
+        case .approveForMe: return "替我审批"
+        case .fullAccess: return "完全访问"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .requestApproval: return "hand.raised"
+        case .approveForMe: return "checkmark.shield"
+        case .fullAccess: return "lock.open"
+        }
+    }
+
+    var sandbox: String {
+        switch self {
+        case .requestApproval, .approveForMe: return "workspace-write"
+        case .fullAccess: return "danger-full-access"
+        }
+    }
+
+    var approvalPolicy: String {
+        switch self {
+        case .requestApproval, .approveForMe: return "on-request"
+        case .fullAccess: return "never"
+        }
+    }
+
+    var approvalsReviewer: String {
+        switch self {
+        case .approveForMe: return "auto_review"
+        case .requestApproval, .fullAccess: return "user"
+        }
+    }
+
+    var sandboxPolicyType: String {
+        switch self {
+        case .requestApproval, .approveForMe: return "workspaceWrite"
+        case .fullAccess: return "dangerFullAccess"
         }
     }
 }
@@ -594,6 +666,45 @@ struct ApprovalResponse: Codable {
 struct RemoteFilesResponse: Codable {
     let path: String
     let entries: [RemoteFileEntry]
+}
+
+struct ProjectReviewResponse: Codable {
+    let path: String
+    let base: String
+    let files: [ProjectReviewFile]
+    let generatedAt: Double
+}
+
+struct ProjectReviewFile: Codable, Identifiable, Equatable {
+    let path: String
+    let status: String
+    let additions: Int
+    let deletions: Int
+    let binary: Bool
+    let oldLineCount: Int?
+    let newLineCount: Int?
+    let lines: [ProjectReviewLine]
+
+    var id: String { path }
+
+    var displayName: String {
+        let name = (path as NSString).lastPathComponent
+        return name.isEmpty ? path : name
+    }
+}
+
+struct ProjectReviewLine: Codable, Equatable, Identifiable {
+    let kind: String
+    let text: String
+    let lineNumber: Int
+
+    var id: String { "\(kind)-\(lineNumber)-\(text)" }
+}
+
+extension ProjectReviewResponse {
+    var displayableFiles: [ProjectReviewFile] {
+        files.filter { !$0.binary }
+    }
 }
 
 struct RemoteFileEntry: Codable, Identifiable, Hashable {

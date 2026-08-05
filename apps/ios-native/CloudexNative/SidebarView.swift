@@ -167,75 +167,90 @@ struct CloudexRootView: View {
 
     private var iPadNavigation: some View {
         GeometryReader { geometry in
-            NavigationSplitView(
-                columnVisibility: $iPadColumnVisibility,
-                preferredCompactColumn: $iPadPreferredCompactColumn
-            ) {
-                iPadSidebarColumn
-                    .navigationSplitViewColumnWidth(
-                        min: 290,
-                        ideal: iPadSidebarWidth(for: geometry.size.width),
-                        max: 360
+            ZStack(alignment: .trailing) {
+                NavigationSplitView(
+                    columnVisibility: $iPadColumnVisibility,
+                    preferredCompactColumn: $iPadPreferredCompactColumn
+                ) {
+                    iPadSidebarColumn(
+                        windowed: isWindowedIPad(for: geometry.size),
+                        bottomSafeArea: geometry.safeAreaInsets.bottom
                     )
-            } detail: {
-                Group {
-                    if let route = iPadSelectedThreadRoute {
-                        NavigationStack {
-                            ContentView(
-                                expectedThreadID: route,
-                                onToggleDirectory: { showingIPadDirectory = true },
-                                showsDirectoryButton: false
-                            )
-                            .id(route)
-                        }
-                        .navigationTitle(viewModel.navigationTitle)
-                        .navigationBarTitleDisplayMode(.inline)
-                        .toolbar {
-                            ToolbarItem(placement: .topBarTrailing) {
-                                Button { showingIPadDirectory = true } label: {
-                                    Image(systemName: "list.bullet")
-                                        .frame(width: 44, height: 44)
-                                        .contentShape(Rectangle())
-                                }
-                                .accessibilityLabel("打开对话目录")
-                            }
-                        }
-                        .toolbar(.visible, for: .navigationBar)
-                        .sheet(isPresented: $showingIPadDirectory) {
-                            NavigationStack {
-                                IPadConversationDirectoryView(
-                                    onSelect: { messageID, turnID in
-                                        requestIPadMessageJump(messageID: messageID, turnID: turnID)
-                                        showingIPadDirectory = false
-                                    },
-                                    onOpenPage: nil,
-                                    onClosePage: nil,
-                                    showsNavigationChrome: false
-                                )
-                                .navigationTitle("对话目录")
-                                .navigationBarTitleDisplayMode(.inline)
-                                .toolbar {
-                                    ToolbarItem(placement: .confirmationAction) {
-                                        Button("完成") { showingIPadDirectory = false }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        ContentUnavailableView(
-                            "选择一个对话",
-                            systemImage: "bubble.left.and.bubble.right",
-                            description: Text("从左侧栏打开对话或创建新对话。")
+                        .navigationSplitViewColumnWidth(
+                            min: 290,
+                            ideal: iPadSidebarWidth(for: geometry.size.width),
+                            max: 360
                         )
+                } detail: {
+                    Group {
+                        if let route = iPadSelectedThreadRoute {
+                            NavigationStack {
+                                ContentView(
+                                    expectedThreadID: route,
+                                    onToggleDirectory: { showingIPadDirectory = true },
+                                    showsDirectoryButton: false
+                                )
+                                .id(route)
+                            }
+                            .navigationTitle(viewModel.navigationTitle)
+                            .navigationBarTitleDisplayMode(.inline)
+                            .toolbar {
+                                ToolbarItem(placement: .topBarTrailing) {
+                                    Button { showingIPadDirectory = true } label: {
+                                        Image(systemName: "list.bullet")
+                                            .frame(width: 44, height: 44)
+                                            .contentShape(Rectangle())
+                                    }
+                                    .accessibilityLabel("打开侧边面板")
+                                }
+                            }
+                            .toolbar(.visible, for: .navigationBar)
+                        } else {
+                            ContentUnavailableView(
+                                "选择一个对话",
+                                systemImage: "bubble.left.and.bubble.right",
+                                description: Text("从左侧栏打开对话或创建新对话。")
+                            )
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                .navigationSplitViewStyle(.balanced)
+                .environment(\.cloudexIsWindowedIPad, isWindowedIPad(for: geometry.size))
+                .environment(\.cloudexBottomSafeArea, geometry.safeAreaInsets.bottom)
+
+            }
+            .sheet(isPresented: $showingIPadDirectory) {
+                NavigationStack {
+                    IPadConversationDirectoryView(
+                        onSelect: { messageID, turnID in
+                            requestIPadMessageJump(messageID: messageID, turnID: turnID)
+                            showingIPadDirectory = false
+                        },
+                        onOpenPage: nil,
+                        onClosePage: nil,
+                        showsNavigationChrome: false
+                    )
+                    .navigationTitle("侧边面板")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button {
+                                showingIPadDirectory = false
+                            } label: {
+                                Image(systemName: "xmark")
+                            }
+                            .accessibilityLabel("关闭侧边面板")
+                        }
                     }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .interactiveDismissDisabled(true)
+                .presentationDragIndicator(.hidden)
             }
-            .navigationSplitViewStyle(.balanced)
         }
     }
 
-    private var iPadSidebarColumn: some View {
+    private func iPadSidebarColumn(windowed: Bool, bottomSafeArea: CGFloat) -> some View {
         List {
             ForEach(iPadSidebarProjects) { project in
                 Section {
@@ -255,6 +270,7 @@ struct CloudexRootView: View {
                                     iPadSearchMatchButton(match, thread: thread, project: project)
                                 }
                             }
+                            .listRowBackground(iPadSelectionRowBackground(for: thread.id))
                         }
                     }
                 } header: {
@@ -285,7 +301,7 @@ struct CloudexRootView: View {
         .navigationTitle("对话")
         .toolbar { rootToolbar }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            conversationSearchBar
+            conversationSearchBar(isWindowedIPad: windowed, bottomSafeArea: bottomSafeArea)
         }
     }
 
@@ -327,6 +343,7 @@ struct CloudexRootView: View {
                                 iPadSearchMatchButton(match, thread: thread, project: project)
                             }
                         }
+                        .listRowBackground(iPadSelectionRowBackground(for: thread.id))
                     }
 
                     if iPadVisibleThreads.isEmpty, !isSearchingMessages {
@@ -433,6 +450,10 @@ struct CloudexRootView: View {
         iPadProjects.first { $0.id == iPadSelectedProjectID }
     }
 
+    private var showsIPadSelectionBackground: Bool {
+        iPadColumnVisibility == .all || iPadColumnVisibility == .doubleColumn
+    }
+
     private var iPadVisibleThreads: [CloudexThread] {
         guard let project = iPadSelectedProject else { return [] }
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -471,15 +492,12 @@ struct CloudexRootView: View {
         } label: {
             ThreadRow(thread: thread)
                 .equatable()
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .listRowBackground(
-            iPadSelectedThreadRoute == thread.id
-                ? Color.accentColor.opacity(0.12)
-                : Color.clear
-        )
         .swipeActions {
             Button(role: .destructive) {
                 Task { await viewModel.archive(thread.id) }
@@ -487,6 +505,15 @@ struct CloudexRootView: View {
                 Label("归档", systemImage: "archivebox")
             }
         }
+    }
+
+    private func iPadSelectionRowBackground(for threadID: String) -> some View {
+        RoundedRectangle(cornerRadius: 20, style: .continuous)
+            .fill(
+                Color.black.opacity(
+                    showsIPadSelectionBackground && iPadSelectedThreadRoute == threadID ? 0.14 : 0
+                )
+            )
     }
 
     private func iPadSearchMatchButton(
@@ -746,6 +773,11 @@ struct CloudexRootView: View {
 
     @ViewBuilder
     private var conversationSearchBar: some View {
+        conversationSearchBar(isWindowedIPad: false, bottomSafeArea: 0)
+    }
+
+    @ViewBuilder
+    private func conversationSearchBar(isWindowedIPad: Bool, bottomSafeArea: CGFloat) -> some View {
         if #available(iOS 26.0, *) {
             // Keep the resting shapes visually separate. The smaller merge
             // threshold still lets the interactive glass expansion join them
@@ -755,20 +787,29 @@ struct CloudexRootView: View {
             }
             .padding(.horizontal, 24)
             .padding(.top, 10)
-            .padding(.bottom, bottomControlPadding)
+            .padding(.bottom, bottomControlPadding(isWindowedIPad: isWindowedIPad, bottomSafeArea: bottomSafeArea))
         } else {
             conversationSearchControls(useLiquidGlass: false)
                 .padding(.horizontal, 24)
                 .padding(.top, 10)
-                .padding(.bottom, bottomControlPadding)
+                .padding(.bottom, bottomControlPadding(isWindowedIPad: isWindowedIPad, bottomSafeArea: bottomSafeArea))
         }
     }
 
-    private var bottomControlPadding: CGFloat {
+    private func bottomControlPadding(isWindowedIPad: Bool, bottomSafeArea: CGFloat) -> CGFloat {
         if keyboardHeight > 0 { return 18 }
-        // Keep the floating iPad window's native bottom safe-area inset. The
-        // iPhone-specific negative adjustment otherwise cancels that spacing.
-        return UIDevice.current.userInterfaceIdiom == .pad ? 0 : -7
+        guard UIDevice.current.userInterfaceIdiom == .pad else { return -7 }
+        guard isWindowedIPad else { return 0 }
+        return max(0, 24 - bottomSafeArea)
+    }
+
+    private func isWindowedIPad(for size: CGSize) -> Bool {
+        let screen = UIScreen.main.bounds.size
+        let screenWidth = max(screen.width, screen.height)
+        let screenHeight = min(screen.width, screen.height)
+        let windowWidth = max(size.width, size.height)
+        let windowHeight = min(size.width, size.height)
+        return windowWidth < screenWidth - 48 || windowHeight < screenHeight - 48
     }
 
     private func conversationSearchControls(useLiquidGlass: Bool) -> some View {

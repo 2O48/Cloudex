@@ -9,7 +9,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   ./start-cloudex.sh
 
 可选环境变量：
-  AUTH_TOKEN  API 访问 Bearer Token；省略时复用或生成临时 Token。
+  AUTH_TOKEN  API 访问 Bearer Token；省略时复用或生成项目内持久化 Token。
+  CLOUDEX_AUTH_TOKEN_FILE  Token 文件路径；默认是项目目录下的 .cloudex-state/auth-token。
   HOST        Cloudex 监听地址，默认 0.0.0.0。
   PORT        Cloudex 监听端口，默认 8787。
   CODEX_BIN   Codex CLI 路径；默认使用 PATH 中的 codex。
@@ -22,7 +23,7 @@ CODEX_BIN="${CODEX_BIN:-$(command -v codex 2>/dev/null || true)}"
 CODEX_BIN="${CODEX_BIN:-$HOME/.codex/packages/standalone/current/bin/codex}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8787}"
-AUTH_TOKEN_FILE="${CLOUDEX_AUTH_TOKEN_FILE:-/tmp/cloudex-auth-token}"
+AUTH_TOKEN_FILE="${CLOUDEX_AUTH_TOKEN_FILE:-$PROJECT_DIR/.cloudex-state/auth-token}"
 
 if [[ ! -x "$CODEX_BIN" ]]; then
   echo "找不到 standalone Codex CLI：$CODEX_BIN" >&2
@@ -31,14 +32,15 @@ if [[ ! -x "$CODEX_BIN" ]]; then
 fi
 
 if [[ -z "${AUTH_TOKEN:-}" ]]; then
+  mkdir -p "$(dirname "$AUTH_TOKEN_FILE")"
   if [[ -f "$AUTH_TOKEN_FILE" ]]; then
     AUTH_TOKEN="$(<"$AUTH_TOKEN_FILE")"
-    echo "未设置 AUTH_TOKEN，已复用上次保存的 Token。"
+    echo "未设置 AUTH_TOKEN，已复用项目内保存的 Token。"
   else
     umask 077
     AUTH_TOKEN="$(node -e 'console.log(require("node:crypto").randomBytes(24).toString("base64url"))')"
     printf '%s\n' "$AUTH_TOKEN" > "$AUTH_TOKEN_FILE"
-    echo "未设置 AUTH_TOKEN，已生成并保存临时 Token。"
+    echo "未设置 AUTH_TOKEN，已生成并保存项目内 Token。"
   fi
   export AUTH_TOKEN
 fi

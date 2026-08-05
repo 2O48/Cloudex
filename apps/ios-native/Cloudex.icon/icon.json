@@ -1,0 +1,51 @@
+{
+  "fill" : "automatic",
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "fill" : "automatic",
+          "glass" : true,
+          "image-name" : "cloudex->_.png",
+          "name" : "cloudex->_"
+        },
+        {
+          "blend-mode" : "normal",
+          "fill" : {
+            "linear-gradient" : [
+              "display-p3:0.62354,0.43530,0.96875,1.00000",
+              "display-p3:0.43530,0.55664,0.96875,1.00000"
+            ],
+            "orientation" : {
+              "start" : {
+                "x" : 0.38741494865950743,
+                "y" : 0
+              },
+              "stop" : {
+                "x" : 0.5956648640392104,
+                "y" : 1
+              }
+            }
+          },
+          "glass" : true,
+          "image-name" : "cloudex-bg.png",
+          "name" : "cloudex-bg"
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.6
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.2
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

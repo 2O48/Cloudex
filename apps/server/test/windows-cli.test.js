@@ -4,7 +4,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { readCliThread } from "../src/cli-sessions.js";
-import { buildCliArgs } from "../src/windows-cli.js";
+import {
+  buildCliArgs,
+  execEventToAppMessage,
+  execItemToAppItem,
+} from "../src/windows-cli.js";
 
 test("windows CLI args resume an existing session with model, effort, and images", () => {
   const args = buildCliArgs({
@@ -52,6 +56,105 @@ test("windows CLI args start a new session in the requested cwd", () => {
     "gpt-5.5",
     "hello",
   ]);
+});
+
+test("exec JSONL command execution events map to live app notifications", () => {
+  const started = execEventToAppMessage({
+    type: "item.started",
+    item: {
+      id: "item_1",
+      type: "command_execution",
+      command: "bash -lc ls",
+      aggregated_output: "",
+      status: "in_progress",
+    },
+  }, { threadId: "019fcc32", turnId: "win-turn-1" });
+  assert.equal(started.method, "item/started");
+  assert.equal(started.params.threadId, "019fcc32");
+  assert.equal(started.params.turnId, "win-turn-1");
+  assert.equal(started.params.itemId, "item_1");
+  assert.equal(started.params.item.type, "commandExecution");
+  assert.equal(started.params.item.command, "bash -lc ls");
+  assert.equal(started.params.item.status, "inProgress");
+  assert.equal(started.params.item.exitCode, null);
+
+  const completed = execEventToAppMessage({
+    type: "item.completed",
+    item: {
+      id: "item_1",
+      type: "command_execution",
+      command: "bash -lc ls",
+      aggregated_output: "README.md\n",
+      exit_code: 0,
+      status: "completed",
+    },
+  }, { threadId: "019fcc32", turnId: "win-turn-1" });
+  assert.equal(completed.method, "item/completed");
+  assert.equal(completed.params.item.status, "completed");
+  assert.equal(completed.params.item.exitCode, 0);
+  assert.equal(completed.params.item.aggregatedOutput, "README.md\n");
+});
+
+test("exec JSONL agent message and file change items map to app protocol", () => {
+  const agent = execEventToAppMessage({
+    type: "item.completed",
+    item: { id: "item_3", type: "agent_message", text: "Done." },
+  }, { threadId: "019fcc32", turnId: "win-turn-1" });
+  assert.equal(agent.method, "item/completed");
+  assert.equal(agent.params.item.type, "agentMessage");
+  assert.equal(agent.params.item.text, "Done.");
+
+  const fileChange = execItemToAppItem({
+    id: "item_4",
+    type: "file_change",
+    changes: [{ path: "src/app.js", kind: "update" }],
+    status: "completed",
+  });
+  assert.equal(fileChange.type, "fileChange");
+  assert.equal(fileChange.activity, "edited");
+  assert.equal(fileChange.status, "completed");
+  assert.deepEqual(fileChange.changes, [{ path: "src/app.js", kind: "update" }]);
+});
+
+test("exec JSONL turn lifecycle events carry a stable thread and turn id", () => {
+  const thread = execEventToAppMessage({
+    type: "thread.started",
+    thread_id: "019fcc32-be0f-7be0-8d6e-185690b6c234",
+  });
+  assert.equal(thread.method, "thread/started");
+  assert.equal(thread.params.threadId, "019fcc32-be0f-7be0-8d6e-185690b6c234");
+
+  const started = execEventToAppMessage(
+    { type: "turn.started" },
+    { threadId: "019fcc32", turnId: "win-turn-1" },
+  );
+  assert.equal(started.method, "turn/started");
+  assert.equal(started.params.turnId, "win-turn-1");
+
+  const completed = execEventToAppMessage(
+    {
+      type: "turn.completed",
+      usage: {
+        input_tokens: 24763,
+        cached_input_tokens: 24448,
+        output_tokens: 122,
+        reasoning_output_tokens: 10,
+      },
+    },
+    { threadId: "019fcc32", turnId: "win-turn-1" },
+  );
+  assert.equal(completed.method, "turn/completed");
+  assert.equal(completed.params.turn.status, "completed");
+  assert.equal(completed.params.usage.inputTokens, 24763);
+  assert.equal(completed.params.usage.outputTokens, 122);
+
+  const failed = execEventToAppMessage(
+    { type: "turn.failed", error: { message: "boom" } },
+    { threadId: "019fcc32", turnId: "win-turn-1" },
+  );
+  assert.equal(failed.method, "turn/failed");
+  assert.equal(failed.params.turn.error.message, "boom");
+  assert.equal(execEventToAppMessage({ type: "unknown.event" }), null);
 });
 
 test("CLI session parser handles function_call shell_command records", async () => {

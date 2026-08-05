@@ -94,7 +94,7 @@ function jsAssignedString(source, variable) {
   try { return JSON.parse(match[1]); } catch { return null; }
 }
 
-function commandActivity(command) {
+export function commandActivity(command) {
   const value = String(command || "").trim();
   const mutating = /(^|[;&|]\s*)(npm|npx|node|xcodebuild|make|kill|mv|cp|rm|mkdir|touch|chmod|git\s+(add|commit|push|pull|checkout|switch|restore|reset)|curl\b[^\n]*(--request|-X)\s*(POST|PUT|PATCH|DELETE))\b/i;
   if (mutating.test(value)) return "ran";

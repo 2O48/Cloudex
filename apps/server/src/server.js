@@ -1026,9 +1026,10 @@ async function handle(req, res, url) {
     // Let clients distinguish replayed history from newly arriving events.
     writeSse(res, "replay-complete", { threadId });
     if (usesWindowsCliFallback()) {
-      writeSse(res, "error", {
-        message: "Live streaming is unavailable on Windows; the app will poll for updates",
-      });
+      // Windows runs the Codex CLI as a child process. Its JSONL events are
+      // bridged into publish() below, so the SSE channel stays open and the
+      // app receives live notifications instead of polling only.
+      writeSse(res, "subscribed", { threadId });
     } else {
       try {
         await client.subscribeThread(threadId);
@@ -1056,6 +1057,7 @@ async function handle(req, res, url) {
         effort: data.effort || null,
         sandbox: data.sandbox || "workspace-write",
         approvalPolicy: data.approvalPolicy || "on-request",
+        onAppMessage: (message) => publish(message),
       });
       thread = (await readCliThreadById(threadId)).thread;
     } else {
@@ -1106,6 +1108,7 @@ async function handle(req, res, url) {
           effort: data.effort || null,
           sandbox: data.sandbox || "workspace-write",
           approvalPolicy: data.approvalPolicy || "on-request",
+          onAppMessage: (message) => publish(message),
         });
       } else {
         const resume = await client.subscribeThread(threadId);

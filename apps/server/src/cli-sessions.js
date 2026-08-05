@@ -57,9 +57,9 @@ function redactCommand(command) {
 
 function commandResult(output) {
   const value = String(output || "");
-  const exitCodeMatch = value.match(/Process exited with code\s+(-?\d+)|Exit code:\s*(-?\d+)/i);
+  const exitCodeMatch = value.match(/Process exited with code\s+(-?\d+)/i);
   const durationMatch = value.match(/Wall time:\s*([^\n\r]+)/i);
-  const exitCode = exitCodeMatch ? Number(exitCodeMatch[1] ?? exitCodeMatch[2]) : null;
+  const exitCode = exitCodeMatch ? Number(exitCodeMatch[1]) : null;
   let status = "completed";
   if (exitCode !== null) status = exitCode === 0 ? "completed" : "failed";
   else if (/Process running with session ID|Script running with cell ID/i.test(value)) status = "inProgress";
@@ -743,16 +743,11 @@ export async function listCliThreads({ archived = false } = {}) {
 
 export async function readCliThreadById(threadId) {
   const files = await findSessionFiles();
-  const matches = files.filter((candidate) => threadIdFromPath(candidate) === threadId);
-  if (matches.length === 0) {
+  const file = files.find((candidate) => threadIdFromPath(candidate) === threadId);
+  if (!file) {
     const error = new Error("CLI session not found");
     error.status = 404;
     throw error;
   }
-  const stats = await Promise.all(matches.map(async (candidate) => ({
-    file: candidate,
-    stat: await fs.stat(candidate),
-  })));
-  const newest = stats.sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs)[0];
-  return readCliThread(newest.file);
+  return readCliThread(file);
 }

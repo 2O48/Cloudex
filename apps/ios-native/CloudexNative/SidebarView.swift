@@ -659,12 +659,13 @@ struct CloudexRootView: View {
         guard usesIPadLayout, !restoredIPadSelection else { return }
         restoredIPadSelection = true
 
-        let target = iPadProjects
-            .flatMap { project in project.threads.map { (project, $0) } }
-            .first { $0.1.id == lastOpenedThreadID }
-            ?? iPadProjects
-                .flatMap { project in project.threads.map { (project, $0) } }
-                .max { ($0.1.updatedAt ?? 0) < ($1.1.updatedAt ?? 0) }
+        let projectThreads: [(project: CloudexProject, thread: CloudexThread)] = iPadProjects.flatMap { project in
+            project.threads.map { thread in
+                (project: project, thread: thread)
+            }
+        }
+        let target = projectThreads.first { $0.thread.id == lastOpenedThreadID }
+            ?? projectThreads.max { ($0.thread.updatedAt ?? 0) < ($1.thread.updatedAt ?? 0) }
 
         guard let (project, thread) = target else {
             normalizeIPadProjectSelection()

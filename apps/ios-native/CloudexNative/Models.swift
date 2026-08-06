@@ -798,6 +798,28 @@ enum DateFormatting {
         if remainingMinutes == 0 { return "\(hours)小时" }
         return "\(hours)小时\(remainingMinutes)分"
     }
+
+    static func wholeSecondDuration(from value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let compact = trimmed
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "")
+
+        if let seconds = Double(compact) {
+            return duration(fromSeconds: seconds).nilIfEmpty
+        }
+        if compact.hasSuffix("ms"),
+           let milliseconds = Double(compact.dropLast(2)) {
+            return duration(fromMilliseconds: milliseconds).nilIfEmpty
+        }
+        if compact.hasSuffix("s"),
+           let seconds = Double(compact.dropLast()) {
+            return duration(fromSeconds: seconds).nilIfEmpty
+        }
+        return trimmed
+    }
 }
 
 extension String {

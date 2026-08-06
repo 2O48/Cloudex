@@ -294,21 +294,7 @@ struct ContentView: View {
     }
 
     private var liquidBackground: some View {
-        ZStack {
-            Color(.systemBackground)
-            RadialGradient(
-                colors: [Color.blue.opacity(0.13), Color.clear],
-                center: .topLeading,
-                startRadius: 15,
-                endRadius: 360
-            )
-            RadialGradient(
-                colors: [Color.purple.opacity(0.09), Color.clear],
-                center: .bottomTrailing,
-                startRadius: 10,
-                endRadius: 320
-            )
-        }
+        Color(.systemBackground)
         .ignoresSafeArea()
     }
 
@@ -319,7 +305,7 @@ struct ContentView: View {
                 let isReady = isNewChat
                     || (expectedThreadID == viewModel.selectedThreadID && !viewModel.isOpeningThread)
                 let content = isReady ? chatContentSnapshot : .empty
-                LazyVStack(spacing: 12) {
+                LazyVStack(alignment: .leading, spacing: 12) {
                     if !isReady {
                         ProgressView("正在打开对话…")
                             .frame(maxWidth: .infinity)
@@ -405,6 +391,7 @@ struct ContentView: View {
 
                     if content.active {
                         ProgressView()
+                            .frame(maxWidth: .infinity, alignment: .center)
                             .padding(.vertical, 8)
                     }
 
@@ -1446,6 +1433,7 @@ private struct PendingSteerBubble: View {
 }
 
 private struct MessageBubble: View {
+    @EnvironmentObject private var viewModel: AppViewModel
     let message: ChatMessage
     let highlightQuery: String?
     @Binding var collapseRequest: Int
@@ -1468,32 +1456,48 @@ private struct MessageBubble: View {
                 onFloatingCollapse: onFloatingProcessCollapse,
                 onFloatingStateChange: onFloatingStateChange
             )
+            .padding(.bottom, -4)
         } else if message.role == .taskSummary || message.role == .compressed || message.role == .system {
             SystemTimelineBubble(message: message)
+        } else if message.role == .assistant {
+            AdaptiveConversationLayout(fillsWidth: true) {
+                messageContent
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             HStack {
                 if message.role == .user { Spacer(minLength: 42) }
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(roleTitle)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(message.role == .error ? Color.red : Color.secondary)
-                    MarkdownText(text: message.text, highlightQuery: highlightQuery)
-                        .font(.body)
-                        .foregroundStyle(message.role == .error ? Color.red : Color.primary)
-                        .multilineTextAlignment(.leading)
-                        .textSelection(.enabled)
+                AdaptiveConversationLayout(fillsWidth: message.role == .assistant) {
+                    messageContent
+                }
+                if message.role != .user && message.role != .assistant {
+                    Spacer(minLength: 42)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: message.role == .user ? .trailing : .leading)
+        }
+    }
 
-                    messageFooter
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 11)
-                .background(bubbleColor, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .overlay {
-                    if message.role == .error {
-                        RoundedRectangle(cornerRadius: 16).stroke(Color.red.opacity(0.3))
-                    }
-                }
-                if message.role != .user { Spacer(minLength: 42) }
+    private var messageContent: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(roleTitle)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(message.role == .error ? Color.red : Color.secondary)
+            MarkdownText(text: message.text, highlightQuery: highlightQuery)
+                .font(.body)
+                .foregroundStyle(message.role == .error ? Color.red : Color.primary)
+                .multilineTextAlignment(.leading)
+                .textSelection(.enabled)
+
+            messageFooter
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background(message.role == .user ? bubbleColor : .clear,
+                    in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            if message.role == .error {
+                RoundedRectangle(cornerRadius: 16).stroke(Color.red.opacity(0.3))
             }
         }
     }
@@ -1511,15 +1515,7 @@ private struct MessageBubble: View {
         }
     }
 
-    private var bubbleColor: Color {
-        switch message.role {
-        case .user: return Color.blue.opacity(0.14)
-        case .assistant, .system: return Color(.secondarySystemBackground)
-        case .error: return Color.red.opacity(0.1)
-        case .execution: return Color(.tertiarySystemBackground)
-        case .processSummary, .compressed, .taskSummary: return Color(.secondarySystemBackground)
-        }
-    }
+    private var bubbleColor: Color { Color.gray.opacity(0.18) }
 
     private var messageTime: String {
         DateFormatting.messageTime(from: message.createdAt)
@@ -1558,7 +1554,7 @@ private struct MessageBubble: View {
                     .foregroundStyle(.secondary)
                     .disabled(isPerformingAction)
                     .accessibilityLabel("填充到输入框")
-                } else {
+                } else if !viewModel.active {
                     Button {
                         Task {
                             isPerformingAction = true
@@ -1600,8 +1596,7 @@ private struct ProcessSummaryBubble: View {
     @State private var loadingDetails = false
 
     var body: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 8) {
                 Button {
                     if expanded {
                         onInteraction(false)
@@ -1630,7 +1625,7 @@ private struct ProcessSummaryBubble: View {
                                 .foregroundStyle(.secondary)
                         }
                         MarkdownText(text: message.text)
-                            .font(.subheadline.weight(.semibold))
+                            .font(.body.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.leading)
                         Spacer(minLength: 0)
@@ -1638,6 +1633,7 @@ private struct ProcessSummaryBubble: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .modifier(ScrollVisibilityModifier { visible in
                     collapseButtonVisible = visible
                     updateFloatingState()
@@ -1651,11 +1647,13 @@ private struct ProcessSummaryBubble: View {
                                     .id("\(item.id)-\(expansionGeneration)")
                             } else {
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text(processItemTitle(item))
-                                        .font(.caption2.weight(.semibold))
-                                        .foregroundStyle(.secondary)
+                                    if item.role != .assistant {
+                                        Text(processItemTitle(item))
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundStyle(.secondary)
+                                    }
                                     MarkdownText(text: item.text)
-                                        .font(.subheadline)
+                                        .font(.body)
                                         .foregroundStyle(.primary)
                                         .textSelection(.enabled)
                                     let time = DateFormatting.messageTime(from: item.createdAt)
@@ -1665,23 +1663,17 @@ private struct ProcessSummaryBubble: View {
                                             .foregroundStyle(.secondary)
                                     }
                                 }
-                                .padding(10)
+                                .padding(.vertical, 2)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                             }
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .background {
                         GeometryReader { geometry in
                             Color.clear.preference(key: ProcessContentHeightKey.self, value: geometry.size.height)
                         }
                     }
-                }
-                let time = DateFormatting.messageTime(from: message.createdAt)
-                if !time.isEmpty {
-                    Text(time)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
                 }
             }
             .padding(.horizontal, 12)
@@ -1691,11 +1683,6 @@ private struct ProcessSummaryBubble: View {
             // long shell commands and diff rows can make the VStack choose
             // an intrinsic width larger than the rounded rectangle.
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-
-            Spacer(minLength: 32)
-        }
         .frame(maxWidth: .infinity, alignment: .leading)
         .onChange(of: message.id) { _, _ in
             expanded = false
@@ -1774,22 +1761,21 @@ private struct SystemTimelineBubble: View {
     let message: ChatMessage
 
     var body: some View {
-        HStack {
-            Spacer(minLength: 0)
-            HStack(spacing: 6) {
-                Image(systemName: iconName)
-                Text(message.text)
-                    .lineLimit(1)
-            }
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(foregroundColor)
-            .fixedSize(horizontal: true, vertical: false)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(Color(.tertiarySystemBackground), in: Capsule())
-            Spacer(minLength: 0)
+        HStack(spacing: 6) {
+            Image(systemName: iconName)
+            Text(message.text)
+                .lineLimit(1)
         }
-        .frame(maxWidth: .infinity, alignment: .center)
+        .font(message.role == .taskSummary ? .body.weight(.semibold) : .caption.weight(.semibold))
+        .foregroundStyle(foregroundColor)
+        .fixedSize(horizontal: message.role != .taskSummary, vertical: false)
+        .frame(maxWidth: message.role == .taskSummary ? .infinity : nil,
+               alignment: message.role == .taskSummary ? .leading : .center)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color(.tertiarySystemBackground), in: Capsule())
+        .frame(maxWidth: .infinity,
+               alignment: message.role == .taskSummary ? .leading : .center)
     }
 
     private var iconName: String {
@@ -1965,6 +1951,46 @@ private struct MarkdownText: View {
     }
 }
 
+private struct AdaptiveConversationLayout: Layout {
+    private let maximumWidth: CGFloat = 720
+    private let maximumFraction: CGFloat = 0.82
+    private let fillsWidth: Bool
+
+    init(fillsWidth: Bool = false) {
+        self.fillsWidth = fillsWidth
+    }
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        guard let subview = subviews.first else { return .zero }
+        let availableWidth = proposal.width ?? maximumWidth
+        let widthLimit = fillsWidth
+            ? max(1, availableWidth)
+            : min(maximumWidth, max(1, availableWidth * maximumFraction))
+        let idealWidth = subview.sizeThatFits(.unspecified).width
+        let width = fillsWidth ? widthLimit : min(max(idealWidth, 1), widthLimit)
+        let measured = subview.sizeThatFits(.init(width: width, height: proposal.height))
+        return CGSize(width: width, height: measured.height)
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        guard let subview = subviews.first else { return }
+        subview.place(
+            at: CGPoint(x: bounds.minX, y: bounds.minY),
+            anchor: .topLeading,
+            proposal: ProposedViewSize(width: bounds.width, height: bounds.height)
+        )
+    }
+}
+
 private struct MarkdownBlock: Identifiable {
     enum Content {
         case paragraph(String)
@@ -2052,44 +2078,43 @@ private struct ExecutionStepRow: View {
 
     var body: some View {
         Button {
-            withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
-        } label: {
-            if message.executionKind == "edit" {
-                editRow
-            } else {
-                HStack(alignment: .top, spacing: 10) {
-                    statusIcon
-                        .frame(width: 18, height: 20)
+                withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
+            } label: {
+                if message.executionKind == "edit" {
+                    editRow
+                } else {
+                    HStack(alignment: .top, spacing: 10) {
+                        statusIcon
+                            .frame(width: 18, height: 20)
 
                         VStack(alignment: .leading, spacing: 5) {
                             Text(message.text)
-                            .font(.system(.subheadline, design: .monospaced).weight(.medium))
-                            .foregroundStyle(.primary)
-                            .lineLimit(expanded ? nil : 3)
-                            .multilineTextAlignment(.leading)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        if let detailText {
-                            Text(detailText)
-                                .font(.caption2)
-                                .foregroundStyle(statusColor)
+                                .font(.system(.subheadline, design: .monospaced).weight(.medium))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(expanded ? nil : 3)
+                                .multilineTextAlignment(.leading)
+                                .textSelection(.enabled)
+                            if let detailText {
+                                Text(detailText)
+                                    .font(.caption2)
+                                    .foregroundStyle(statusColor)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        Spacer(minLength: 0)
+                        if canExpand {
+                            Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .padding(.top, 3)
                         }
                     }
-                    Spacer(minLength: 0)
-                    if canExpand {
-                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(.top, 3)
-                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
-        }
-        .buttonStyle(.plain)
+            .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var editRow: some View {
@@ -2099,7 +2124,7 @@ private struct ExecutionStepRow: View {
                     .frame(width: 18, height: 20)
                 Text(editTitle)
                     .font(.system(.subheadline, design: .monospaced).weight(.medium))
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(.secondary)
                     .lineLimit(nil)
                     .multilineTextAlignment(.leading)
                     .textSelection(.enabled)
@@ -2139,11 +2164,9 @@ private struct ExecutionStepRow: View {
                     .padding(.trailing, 12)
                     .padding(.top, 6)
             }
-        }
-        .padding(.bottom, 10)
+            }
+            .padding(.bottom, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(.secondarySystemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
     @ViewBuilder

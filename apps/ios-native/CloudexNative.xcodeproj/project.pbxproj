@@ -34,11 +34,11 @@
 		B00000000000000000000007 /* SidebarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarView.swift; sourceTree = "<group>"; };
 		B00000000000000000000008 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		B00000000000000000000009 /* RemoteFilePickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteFilePickerView.swift; sourceTree = "<group>"; };
+		B0000000000000000000000A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B0000000000000000000000B /* CloudexNative.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CloudexNative.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B0000000000000000000000C /* LocalConversationCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalConversationCache.swift; sourceTree = "<group>"; };
 		B0000000000000000000000D /* WorkspaceTabsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceTabsView.swift; sourceTree = "<group>"; };
 		B0000000000000000000000E /* CodePreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodePreviewView.swift; sourceTree = "<group>"; };
-		B0000000000000000000000A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		B0000000000000000000000B /* CloudexNative.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CloudexNative.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B0000000000000000000000F /* Cloudex.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.icon; path = Cloudex.icon; sourceTree = "<group>"; };
 		B00000000000000000000010 /* CloudexNotificationIcon.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = CloudexNotificationIcon.png; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -133,7 +133,7 @@
 			};
 			buildConfigurationList = G00000000000000000000001 /* Build configuration list for PBXProject "CloudexNative" */;
 			compatibilityVersion = "Xcode 14.0";
-			developmentRegion = zh-Hans;
+			developmentRegion = "zh-Hans";
 			hasScannedForEncodings = 0;
 			knownRegions = (
 				en,
@@ -226,15 +226,21 @@
 		F00000000000000000000003 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = Cloudex;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 95VS96F47C;
 				DEVELOPMENT_ASSET_PATHS = "";
+				DEVELOPMENT_TEAM = M9N34Y7L2C;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = CloudexNative/Info.plist;
-				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
+				INFOPLIST_KEY_CFBundleDisplayName = Cloudex;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.cloudex.native;
+				PRODUCT_BUNDLE_IDENTIFIER = com.voc2048.cloudex;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -246,15 +252,21 @@
 		F00000000000000000000004 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = Cloudex;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 95VS96F47C;
 				DEVELOPMENT_ASSET_PATHS = "";
+				DEVELOPMENT_TEAM = M9N34Y7L2C;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = CloudexNative/Info.plist;
-				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
+				INFOPLIST_KEY_CFBundleDisplayName = Cloudex;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.cloudex.native;
+				PRODUCT_BUNDLE_IDENTIFIER = com.voc2048.cloudex;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SWIFT_EMIT_LOC_STRINGS = YES;

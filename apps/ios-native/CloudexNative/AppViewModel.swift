@@ -194,14 +194,13 @@ final class AppViewModel: ObservableObject {
                         && !existingProcessIDs.contains($0.id)
                 })
                 if let compressedMessage { processItems.append(compressedMessage) }
-                if let durationMessage { processItems.append(durationMessage) }
                 processItems = mergeSemanticExecutionItems(processItems)
 
                 if !processItems.isEmpty || (turn.processItemCount ?? 0) > 0 {
                     result.append(ChatMessage(
                         id: "\(turn.id)-process-summary",
                         role: .processSummary,
-                        text: processSummaryText(processItems),
+                        text: processSummaryText(durationMessage?.text),
                         processItems: processItems,
                         createdAt: processItems.compactMap(\.createdAt).min(),
                         sourceTurnID: turn.id,
@@ -289,7 +288,7 @@ final class AppViewModel: ObservableObject {
                 role: .execution,
                 text: text,
                 executionStatus: item.status,
-                executionDuration: item.duration,
+                executionDuration: DateFormatting.wholeSecondDuration(from: item.duration),
                 executionExitCode: item.exitCode,
                 executionKind: kind,
                 editDiff: item.diff,
@@ -620,8 +619,7 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func processSummaryText(_ items: [ChatMessage]) -> String {
-        let taskSummary = items.last { $0.role == .taskSummary }?.text
+    private func processSummaryText(_ taskSummary: String?) -> String {
         guard let taskSummary, !taskSummary.isEmpty else { return "查看过程" }
         return "查看过程 · \(taskSummary)"
     }

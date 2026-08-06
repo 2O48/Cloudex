@@ -1,0 +1,3 @@
+"CFBundleDisplayName" = "Cloudex";
+"NSCameraUsageDescription" = "Cloudex uses the camera to scan a server connection QR code and fill in the address and token.";
+"NSLocalNetworkUsageDescription" = "Cloudex needs access to the local Codex control server on your computer.";

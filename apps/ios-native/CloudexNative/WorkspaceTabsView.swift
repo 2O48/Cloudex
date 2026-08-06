@@ -263,11 +263,11 @@ struct ProjectReviewView: View {
                     HStack(spacing: 8) {
                         Image(systemName: "arrow.triangle.branch")
                             .foregroundStyle(.secondary)
-                        Text("相对 \(review.base)")
+                        Text(cloudexLocalized("相对 %@", review.base))
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
                         Spacer()
-                        Text("\(files.count) 个文件")
+                        Text(cloudexLocalized("%lld 个文件", Int64(files.count)))
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                         Text("+\(totalAdditions)")
@@ -322,7 +322,7 @@ struct ProjectReviewView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
-                .accessibilityLabel(isCollapsed ? "展开文件差异" : "收起文件差异")
+                .accessibilityLabel(cloudexLocalized(isCollapsed ? "展开文件差异" : "收起文件差异"))
             }
             .font(.caption2.monospacedDigit())
             .padding(.horizontal, 10)
@@ -362,8 +362,8 @@ struct ProjectReviewView: View {
                                             Image(systemName: "ellipsis")
                                         }
                                         Text(loadingHiddenSegmentIDs.contains(item.id)
-                                             ? "正在读取 \(hiddenLineCount) 行"
-                                             : "\(hiddenLineCount) 行隐藏，点击展开")
+                                             ? cloudexLocalized("正在读取 %lld 行", Int64(hiddenLineCount))
+                                             : cloudexLocalized("%lld 行隐藏，点击展开", Int64(hiddenLineCount)))
                                     }
                                     .font(.caption2.weight(.medium))
                                     .foregroundStyle(.secondary)
@@ -374,7 +374,7 @@ struct ProjectReviewView: View {
                                 .buttonStyle(.plain)
                                 .disabled(loadingHiddenSegmentIDs.contains(item.id))
                                 .background(Color(.secondarySystemBackground).opacity(0.7))
-                                .accessibilityLabel("展开隐藏的 \(hiddenLineCount) 行")
+                                .accessibilityLabel(cloudexLocalized("展开隐藏的 %lld 行", Int64(hiddenLineCount)))
                             }
                         }
                     }
@@ -510,7 +510,7 @@ struct ProjectReviewView: View {
                     throw NSError(
                         domain: "CloudexReview",
                         code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "无法读取隐藏行内容"]
+                        userInfo: [NSLocalizedDescriptionKey: cloudexLocalized("无法读取隐藏行内容")]
                     )
                 }
                 let normalized = source
@@ -704,25 +704,21 @@ struct WorkspacePathBar: View {
     }
 
     private var pathItems: [WorkspacePathItem] {
-        let normalizedRoot = (rootPath as NSString).standardizingPath
-        let normalizedCurrent = (currentPath as NSString).standardizingPath
-        let rootName = (normalizedRoot as NSString).lastPathComponent.isEmpty
-            ? "工作区"
-            : (normalizedRoot as NSString).lastPathComponent
-        var items = [WorkspacePathItem(name: rootName, path: normalizedRoot)]
+        let root = WorkspacePathDescriptor(rootPath)
+        let current = WorkspacePathDescriptor(currentPath)
+        let rootName = root.lastComponent ?? "工作区"
+        var items = [WorkspacePathItem(name: rootName, path: rootPath)]
 
-        guard normalizedCurrent != normalizedRoot,
-              normalizedCurrent.hasPrefix(normalizedRoot + "/") else {
+        guard current.isDescendant(of: root) else {
             return [WorkspacePathItem(
-                name: (normalizedCurrent as NSString).lastPathComponent.isEmpty ? "工作区" : (normalizedCurrent as NSString).lastPathComponent,
-                path: normalizedCurrent
+                name: current.lastComponent ?? "工作区",
+                path: currentPath
             )]
         }
 
-        let relativePath = String(normalizedCurrent.dropFirst(normalizedRoot.count + 1))
-        var accumulatedPath = normalizedRoot
-        for component in relativePath.split(separator: "/") {
-            accumulatedPath = (accumulatedPath as NSString).appendingPathComponent(String(component))
+        var accumulatedPath = rootPath
+        for component in current.components.dropFirst(root.components.count) {
+            accumulatedPath = root.appending(component: component, to: accumulatedPath)
             items.append(WorkspacePathItem(name: String(component), path: accumulatedPath))
         }
         return items
@@ -752,6 +748,63 @@ private struct WorkspacePathContentWidthKey: PreferenceKey {
 private struct WorkspacePathItem {
     let name: String
     let path: String
+}
+
+/// Describes a remote path without relying on the host platform's path rules.
+/// The app runs on iOS, but the server may be running on Windows.
+private struct WorkspacePathDescriptor {
+    let anchor: String
+    let components: [Substring]
+    let separator: Character
+    let isWindows: Bool
+
+    init(_ path: String) {
+        let slashPath = path.replacingOccurrences(of: "\\", with: "/")
+        let hasDrivePrefix = slashPath.count >= 2
+            && slashPath[slashPath.index(slashPath.startIndex, offsetBy: 1)] == ":"
+        isWindows = path.contains("\\") || hasDrivePrefix
+        separator = path.contains("\\") ? "\\" : "/"
+
+        if hasDrivePrefix {
+            anchor = String(slashPath.prefix(3))
+            let start = slashPath.index(slashPath.startIndex, offsetBy: min(3, slashPath.count))
+            components = slashPath[start...].split(separator: "/", omittingEmptySubsequences: true)
+        } else if slashPath.hasPrefix("/") {
+            anchor = "/"
+            components = slashPath.drop(while: { $0 == "/" })
+                .split(separator: "/", omittingEmptySubsequences: true)
+        } else {
+            anchor = ""
+            components = slashPath.split(separator: "/", omittingEmptySubsequences: true)
+        }
+    }
+
+    var lastComponent: String? {
+        components.last.map(String.init)
+    }
+
+    func isDescendant(of parent: WorkspacePathDescriptor) -> Bool {
+        guard comparison(anchor) == comparison(parent.anchor),
+              components.count > parent.components.count else {
+            return false
+        }
+
+        return zip(parent.components, components).allSatisfy {
+            comparison(String($0)) == comparison(String($1))
+        }
+    }
+
+    func appending(component: Substring, to path: String) -> String {
+        let component = String(component)
+        if path.hasSuffix("/") || path.hasSuffix("\\") {
+            return path + component
+        }
+        return path + String(separator) + component
+    }
+
+    private func comparison(_ value: String) -> String {
+        isWindows ? value.lowercased() : value
+    }
 }
 
 private struct WorkspacePathBarSurface: ViewModifier {

@@ -22,6 +22,12 @@
 		A0000000000000000000000D /* CodePreviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000E /* CodePreviewView.swift */; };
 		A0000000000000000000000E /* Cloudex.icon in Resources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000F /* Cloudex.icon */; };
 		A0000000000000000000000F /* CloudexNotificationIcon.png in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000010 /* CloudexNotificationIcon.png */; };
+		A00000000000000000000010 /* Localizable.strings (English) in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000011 /* Localizable.strings (English) */; };
+		A00000000000000000000011 /* Localizable.strings (Traditional Chinese) in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000012 /* Localizable.strings (Traditional Chinese) */; };
+		A00000000000000000000012 /* Localizable.strings (Japanese) in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000013 /* Localizable.strings (Japanese) */; };
+		A00000000000000000000013 /* InfoPlist.strings (English) in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000014 /* InfoPlist.strings (English) */; };
+		A00000000000000000000014 /* InfoPlist.strings (Traditional Chinese) in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000015 /* InfoPlist.strings (Traditional Chinese) */; };
+		A00000000000000000000015 /* InfoPlist.strings (Japanese) in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000016 /* InfoPlist.strings (Japanese) */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -41,6 +47,12 @@
 		B0000000000000000000000E /* CodePreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodePreviewView.swift; sourceTree = "<group>"; };
 		B0000000000000000000000F /* Cloudex.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.icon; path = Cloudex.icon; sourceTree = "<group>"; };
 		B00000000000000000000010 /* CloudexNotificationIcon.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = CloudexNotificationIcon.png; sourceTree = "<group>"; };
+		B00000000000000000000011 /* Localizable.strings (English) */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; path = en.lproj/Localizable.strings; sourceTree = "<group>"; };
+		B00000000000000000000012 /* Localizable.strings (Traditional Chinese) */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; path = zh-Hant.lproj/Localizable.strings; sourceTree = "<group>"; };
+		B00000000000000000000013 /* Localizable.strings (Japanese) */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; path = ja.lproj/Localizable.strings; sourceTree = "<group>"; };
+		B00000000000000000000014 /* InfoPlist.strings (English) */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; path = en.lproj/InfoPlist.strings; sourceTree = "<group>"; };
+		B00000000000000000000015 /* InfoPlist.strings (Traditional Chinese) */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; path = zh-Hant.lproj/InfoPlist.strings; sourceTree = "<group>"; };
+		B00000000000000000000016 /* InfoPlist.strings (Japanese) */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; path = ja.lproj/InfoPlist.strings; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -81,6 +93,12 @@
 				B0000000000000000000000E /* CodePreviewView.swift */,
 				B00000000000000000000010 /* CloudexNotificationIcon.png */,
 				B0000000000000000000000A /* Info.plist */,
+				B00000000000000000000011 /* Localizable.strings (English) */,
+				B00000000000000000000012 /* Localizable.strings (Traditional Chinese) */,
+				B00000000000000000000013 /* Localizable.strings (Japanese) */,
+				B00000000000000000000014 /* InfoPlist.strings (English) */,
+				B00000000000000000000015 /* InfoPlist.strings (Traditional Chinese) */,
+				B00000000000000000000016 /* InfoPlist.strings (Japanese) */,
 			);
 			path = CloudexNative;
 			sourceTree = "<group>";
@@ -139,6 +157,8 @@
 				en,
 				Base,
 				"zh-Hans",
+				"zh-Hant",
+				ja,
 			);
 			mainGroup = C00000000000000000000001;
 			packageReferences = (
@@ -160,6 +180,12 @@
 			files = (
 				A0000000000000000000000E /* Cloudex.icon in Resources */,
 				A0000000000000000000000F /* CloudexNotificationIcon.png in Resources */,
+				A00000000000000000000010 /* Localizable.strings (English) in Resources */,
+				A00000000000000000000011 /* Localizable.strings (Traditional Chinese) in Resources */,
+				A00000000000000000000012 /* Localizable.strings (Japanese) in Resources */,
+				A00000000000000000000013 /* InfoPlist.strings (English) in Resources */,
+				A00000000000000000000014 /* InfoPlist.strings (Traditional Chinese) in Resources */,
+				A00000000000000000000015 /* InfoPlist.strings (Japanese) in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

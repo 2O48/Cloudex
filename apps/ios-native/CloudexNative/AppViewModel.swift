@@ -28,7 +28,7 @@ final class AppViewModel: ObservableObject {
             UserDefaults.standard.set(pendingSteerDraft, forKey: "cloudex.pendingSteerDraft")
         }
     }
-    @Published var status = "未连接"
+    @Published var status = cloudexLocalized("未连接")
     @Published var isServerReachable = false
     @Published var isBusy = false
     @Published var isOpeningThread = false
@@ -108,7 +108,7 @@ final class AppViewModel: ObservableObject {
 
     var client: APIClient { APIClient(serverURL: serverURL, token: authToken) }
     var activeConnectionTitle: String {
-        serverURL == normalizedURL(tailscaleServerURL) ? "Tailscale" : "局域网"
+        serverURL == normalizedURL(tailscaleServerURL) ? "Tailscale" : cloudexLocalized("局域网")
     }
     var selectedProject: CloudexProject? { projects.first { $0.cwd == selectedProjectCWD } }
     var selectedThread: CloudexThread? { detail?.thread }
@@ -118,11 +118,11 @@ final class AppViewModel: ObservableObject {
     var selectedModel: CodexModel? { models.first { $0.identifier == selectedModelID } }
     var availableEfforts: [ReasoningEffortOption] { selectedModel?.supportedReasoningEfforts ?? [] }
     var selectedEffortTitle: String {
-        availableEfforts.first { $0.reasoningEffort == selectedEffortID }?.title ?? "默认"
+        availableEfforts.first { $0.reasoningEffort == selectedEffortID }?.title ?? cloudexLocalized("默认")
     }
     var compactModelTitle: String {
         let title = selectedModel?.title
-            ?? (!selectedModelID.isEmpty ? selectedModelID : (modelsLoading ? "读取中" : "模型"))
+            ?? (!selectedModelID.isEmpty ? selectedModelID : cloudexLocalized(modelsLoading ? "读取中" : "模型"))
         return title
             .replacingOccurrences(of: "GPT-", with: "")
             .replacingOccurrences(of: "gpt-", with: "")
@@ -139,11 +139,11 @@ final class AppViewModel: ObservableObject {
     }
 
     var navigationTitle: String {
-        if isCreatingNew { return "新对话" }
+        if isCreatingNew { return cloudexLocalized("新对话") }
         return selectedThread?.title ?? "Cloudex"
     }
 
-    var projectTitle: String { selectedProject?.displayName ?? "选择项目" }
+    var projectTitle: String { selectedProject?.displayName ?? cloudexLocalized("选择项目") }
 
     var messages: [ChatMessage] {
         renderedMessages
@@ -263,7 +263,7 @@ final class AppViewModel: ObservableObject {
             return ChatMessage(
                 id: item.id ?? "\(turnID)-compressed-\(fallbackIndex)",
                 role: .compressed,
-                text: item.renderedText.isEmpty ? "上下文已压缩" : item.renderedText,
+                text: item.renderedText.isEmpty ? cloudexLocalized("上下文已压缩") : item.renderedText,
                 createdAt: item.createdAt,
                 isCompressed: true
             )
@@ -308,15 +308,15 @@ final class AppViewModel: ObservableObject {
         guard let duration else { return nil }
         let statusText: String
         switch turn.status {
-        case "failed": statusText = "任务失败"
-        case "interrupted": statusText = "任务已中断"
-        case "cancelled", "canceled": statusText = "任务已取消"
-        default: statusText = "任务完成"
+        case "failed": statusText = cloudexLocalized("任务失败")
+        case "interrupted": statusText = cloudexLocalized("任务已中断")
+        case "cancelled", "canceled": statusText = cloudexLocalized("任务已取消")
+        default: statusText = cloudexLocalized("任务完成")
         }
         return ChatMessage(
             id: "\(turn.id)-duration",
             role: .taskSummary,
-            text: "\(statusText) · 用时 \(duration)",
+            text: cloudexLocalized("%@ · 用时 %@", statusText, duration),
             createdAt: (turn.completedAt ?? turn.startedAt).map { $0 + 0.0001 }
         )
     }
@@ -326,7 +326,7 @@ final class AppViewModel: ObservableObject {
         return ChatMessage(
             id: "\(turn.id)-compressed",
             role: .compressed,
-            text: "上下文已压缩",
+            text: cloudexLocalized("上下文已压缩"),
             createdAt: turn.completedAt ?? turn.startedAt,
             isCompressed: true
         )
@@ -612,8 +612,8 @@ final class AppViewModel: ObservableObject {
     }
 
     private func processSummaryText(_ taskSummary: String?) -> String {
-        guard let taskSummary, !taskSummary.isEmpty else { return "查看过程" }
-        return "查看过程 · \(taskSummary)"
+        guard let taskSummary, !taskSummary.isEmpty else { return cloudexLocalized("查看过程") }
+        return cloudexLocalized("查看过程 · %@", taskSummary)
     }
 
     private func shouldHidePersistedLiveMessage(_ item: TurnItem, turnID: String) -> Bool {
@@ -686,7 +686,7 @@ final class AppViewModel: ObservableObject {
         liveMessages.append(ChatMessage(
             id: id,
             role: .compressed,
-            text: "上下文已压缩",
+            text: cloudexLocalized("上下文已压缩"),
             createdAt: nextLiveCreatedAt(),
             isCompressed: true
         ))
@@ -1023,7 +1023,11 @@ final class AppViewModel: ObservableObject {
                 applyProjects(projectResponse.data)
                 await synchronizeSelectedThreadIfNeeded(from: projectResponse.data)
                 if let approvalsResponse { pendingApprovals = approvalsResponse.data }
-                status = "已连接 · \(activeConnectionTitle) · \(Date().formatted(date: .omitted, time: .standard))"
+                status = cloudexLocalized(
+                    "已连接 · %@ · %@",
+                    activeConnectionTitle,
+                    Date().formatted(date: .omitted, time: .standard)
+                )
                 if switchedConnection && streamsStarted {
                     connectGlobalStream()
                     if let selectedThreadID { connectThreadStream(threadID: selectedThreadID) }
@@ -1034,7 +1038,10 @@ final class AppViewModel: ObservableObject {
             }
         }
         isServerReachable = false
-        status = "连接失败：\(lastError?.localizedDescription ?? "无法访问局域网或 Tailscale 地址")"
+        status = cloudexLocalized(
+            "连接失败：%@",
+            lastError?.localizedDescription ?? cloudexLocalized("无法访问局域网或 Tailscale 地址")
+        )
     }
 
     func reconnect() async {
@@ -1242,7 +1249,7 @@ final class AppViewModel: ObservableObject {
             removePersistedLiveMessages(from: result)
             liveRunning = result.thread.isActive
             if let error = result.turns.last(where: { $0.error != nil })?.error {
-                status = "任务失败：\(error.displayText)"
+                status = cloudexLocalized("任务失败：%@", error.displayText)
             }
             if wasActive && !active {
                 schedulePendingSteerAutoSend()
@@ -1747,7 +1754,7 @@ final class AppViewModel: ObservableObject {
         do {
             let url = try client.makeURL(path: "/api/events")
             globalSSE.onOpen = { [weak self] in
-                Task { @MainActor in self?.status = "已连接 · 实时同步" }
+                Task { @MainActor in self?.status = cloudexLocalized("已连接 · 实时同步") }
             }
             globalSSE.onEvent = { [weak self] event in
                 Task { @MainActor in self?.handleGlobalEvent(event) }
@@ -1997,7 +2004,7 @@ final class AppViewModel: ObservableObject {
             liveRunning = false
             if let errorText = notificationErrorText(params) {
                 localError = errorText
-                status = "任务失败：\(errorText)"
+                status = cloudexLocalized("任务失败：%@", errorText)
                 notifyTaskResultOnce(threadID: expectedThreadID, params: params, success: false, detail: errorText)
             } else {
                 notifyTaskResultOnce(threadID: expectedThreadID, params: params, success: false)
@@ -2007,7 +2014,7 @@ final class AppViewModel: ObservableObject {
             liveRunning = false
             if let errorText = notificationErrorText(params) {
                 localError = errorText
-                status = "任务失败：\(errorText)"
+                status = cloudexLocalized("任务失败：%@", errorText)
                 notifyTaskResultOnce(threadID: expectedThreadID, params: params, success: false, detail: errorText)
             } else {
                 localError = nil

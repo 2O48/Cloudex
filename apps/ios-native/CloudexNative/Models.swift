@@ -53,6 +53,15 @@ func highlightedAttributedString(_ source: AttributedString, query: String?) -> 
     return result
 }
 
+func cloudexLocalized(_ key: String) -> String {
+    NSLocalizedString(key, bundle: .main, value: key, comment: "")
+}
+
+func cloudexLocalized(_ key: String, _ arguments: CVarArg...) -> String {
+    let format = NSLocalizedString(key, bundle: .main, value: key, comment: "")
+    return String(format: format, locale: Locale.current, arguments: arguments)
+}
+
 enum ConnectionMode: String, CaseIterable, Identifiable, Codable {
     case automatic
     case lan
@@ -62,8 +71,8 @@ enum ConnectionMode: String, CaseIterable, Identifiable, Codable {
 
     var title: String {
         switch self {
-        case .automatic: return "自动"
-        case .lan: return "局域网"
+        case .automatic: return cloudexLocalized("自动")
+        case .lan: return cloudexLocalized("局域网")
         case .tailscale: return "Tailscale"
         }
     }
@@ -78,9 +87,9 @@ enum CodexExecutionMode: String, CaseIterable, Identifiable, Codable {
 
     var title: String {
         switch self {
-        case .requestApproval: return "请求批准"
-        case .approveForMe: return "替我审批"
-        case .fullAccess: return "完全访问"
+        case .requestApproval: return cloudexLocalized("请求批准")
+        case .approveForMe: return cloudexLocalized("替我审批")
+        case .fullAccess: return cloudexLocalized("完全访问")
         }
     }
 
@@ -178,9 +187,9 @@ enum ApprovalDecision: String {
 
     var systemTitle: String {
         switch self {
-        case .accept: return "用户已允许操作"
-        case .acceptForSession: return "用户已永久允许当前会话"
-        case .decline: return "用户已禁止操作"
+        case .accept: return cloudexLocalized("用户已允许操作")
+        case .acceptForSession: return cloudexLocalized("用户已永久允许当前会话")
+        case .decline: return cloudexLocalized("用户已禁止操作")
         }
     }
 }
@@ -511,7 +520,7 @@ struct TurnErrorPayload: Codable, Equatable {
             return
         }
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        message = (try? container.decode(String.self, forKey: .message)) ?? "任务执行失败"
+        message = (try? container.decode(String.self, forKey: .message)) ?? cloudexLocalized("任务执行失败")
         code = (try? container.decode(String.self, forKey: .codexErrorInfo))
             ?? (try? container.decode(String.self, forKey: .codexErrorInfoSnake))
             ?? (try? container.decode(String.self, forKey: .code))
@@ -593,7 +602,7 @@ struct CodexModel: Codable, Equatable {
     }
 
     var identifier: String { rawID ?? model ?? displayName ?? "unknown" }
-    var title: String { displayName ?? model ?? rawID ?? "未知模型" }
+    var title: String { displayName ?? model ?? rawID ?? cloudexLocalized("未知模型") }
 }
 
 struct ReasoningEffortOption: Codable, Equatable, Identifiable {
@@ -638,12 +647,12 @@ struct ReasoningEffortOption: Codable, Equatable, Identifiable {
 
     var title: String {
         switch reasoningEffort {
-        case "low": return "低"
-        case "medium": return "中"
-        case "high": return "高"
-        case "xhigh": return "超高"
-        case "max": return "最大"
-        case "ultra": return "极限"
+        case "low": return cloudexLocalized("低")
+        case "medium": return cloudexLocalized("中")
+        case "high": return cloudexLocalized("高")
+        case "xhigh": return cloudexLocalized("超高")
+        case "max": return cloudexLocalized("最大")
+        case "ultra": return cloudexLocalized("极限")
         default: return reasoningEffort
         }
     }
@@ -787,16 +796,18 @@ enum DateFormatting {
     static func duration(fromSeconds seconds: Double?) -> String {
         guard let seconds, seconds >= 0 else { return "" }
         let rounded = Int(seconds.rounded())
-        if rounded < 60 { return "\(rounded)秒" }
+        if rounded < 60 { return cloudexLocalized("%lld秒", Int64(rounded)) }
         let minutes = rounded / 60
         let remainingSeconds = rounded % 60
         if minutes < 60 {
-            return remainingSeconds == 0 ? "\(minutes)分" : "\(minutes)分\(remainingSeconds)秒"
+            return remainingSeconds == 0
+                ? cloudexLocalized("%lld分", Int64(minutes))
+                : cloudexLocalized("%lld分%lld秒", Int64(minutes), Int64(remainingSeconds))
         }
         let hours = minutes / 60
         let remainingMinutes = minutes % 60
-        if remainingMinutes == 0 { return "\(hours)小时" }
-        return "\(hours)小时\(remainingMinutes)分"
+        if remainingMinutes == 0 { return cloudexLocalized("%lld小时", Int64(hours)) }
+        return cloudexLocalized("%lld小时%lld分", Int64(hours), Int64(remainingMinutes))
     }
 
     static func wholeSecondDuration(from value: String?) -> String? {

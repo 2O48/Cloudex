@@ -1,6 +1,10 @@
 import SwiftUI
 import UserNotifications
 
+extension Notification.Name {
+    static let cloudexOpenNotificationSettings = Notification.Name("CloudexOpenNotificationSettings")
+}
+
 @main
 struct CloudexNativeApp: App {
     @UIApplicationDelegateAdaptor(CloudexAppDelegate.self) private var appDelegate
@@ -57,15 +61,15 @@ final class CloudexNotificationManager: NSObject, UNUserNotificationCenterDelega
             UNNotificationCategory(
                 identifier: Self.approvalCategory,
                 actions: [
-                    UNNotificationAction(identifier: Self.allowAction, title: "允许", options: []),
-                    UNNotificationAction(identifier: Self.sessionAction, title: "始终允许", options: []),
-                    UNNotificationAction(identifier: Self.denyAction, title: "禁止", options: [.destructive])
+                    UNNotificationAction(identifier: Self.allowAction, title: cloudexLocalized("允许"), options: []),
+                    UNNotificationAction(identifier: Self.sessionAction, title: cloudexLocalized("始终允许"), options: []),
+                    UNNotificationAction(identifier: Self.denyAction, title: cloudexLocalized("禁止"), options: [.destructive])
                 ],
                 intentIdentifiers: [],
                 options: [.customDismissAction]
             )
         ])
-        center.requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+        center.requestAuthorization(options: [.alert, .sound, .badge, .providesAppNotificationSettings]) { _, _ in }
     }
 
     func attach(viewModel: AppViewModel) {
@@ -79,7 +83,7 @@ final class CloudexNotificationManager: NSObject, UNUserNotificationCenterDelega
     func scheduleApproval(_ approval: ApprovalRequest) {
         guard UserDefaults.standard.object(forKey: "cloudex.notifyApprovals") as? Bool ?? true else { return }
         let content = UNMutableNotificationContent()
-        content.title = "Cloudex 需要你的确认"
+        content.title = cloudexLocalized("Cloudex 需要你的确认")
         content.body = approval.notificationSummary
         content.sound = .default
         content.categoryIdentifier = Self.approvalCategory
@@ -104,7 +108,7 @@ final class CloudexNotificationManager: NSObject, UNUserNotificationCenterDelega
         ) as? Bool ?? true
         guard enabled else { return }
         let content = UNMutableNotificationContent()
-        content.title = success ? "任务已完成" : "任务失败"
+        content.title = cloudexLocalized(success ? "任务已完成" : "任务失败")
         content.body = detail?.isEmpty == false ? "\(title)\n\(detail!)" : title
         content.sound = .default
         content.userInfo = ["threadID": threadID]
@@ -122,6 +126,15 @@ final class CloudexNotificationManager: NSObject, UNUserNotificationCenterDelega
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
         completionHandler([.banner, .sound, .badge])
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        openSettingsFor notification: UNNotification?
+    ) {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .cloudexOpenNotificationSettings, object: nil)
+        }
     }
 
     func userNotificationCenter(
@@ -155,12 +168,13 @@ final class CloudexNotificationManager: NSObject, UNUserNotificationCenterDelega
 
 private extension ApprovalRequest {
     var notificationSummary: String {
-        if let command, !command.isEmpty { return "命令：\(command)" }
-        if let permissionSummary, !permissionSummary.isEmpty { return "权限：\(permissionSummary)" }
+        if let command, !command.isEmpty { return cloudexLocalized("命令：%@", command) }
+        if let permissionSummary, !permissionSummary.isEmpty { return cloudexLocalized("权限：%@", permissionSummary) }
         if let context = networkApprovalContext, let host = context.host, !host.isEmpty {
-            return "网络：\(context.protocolName.map { "\($0)://" } ?? "")\(host)\(context.port.map { ":\($0)" } ?? "")"
+            let address = "\(context.protocolName.map { "\($0)://" } ?? "")\(host)\(context.port.map { ":\($0)" } ?? "")"
+            return cloudexLocalized("网络：%@", address)
         }
         if let reason, !reason.isEmpty { return reason }
-        return "有一项操作等待确认"
+        return cloudexLocalized("有一项操作等待确认")
     }
 }

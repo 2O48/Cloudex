@@ -89,7 +89,7 @@ struct ContentView: View {
                         }
                         .buttonStyle(.plain)
                         .liquidGlass(in: Circle(), interactive: true)
-                        .accessibilityLabel("收起查看过程")
+                        .accessibilityLabel(cloudexLocalized("收起查看过程"))
                         Spacer(minLength: 0)
                     }
                     .padding(.leading, 14)
@@ -142,12 +142,12 @@ struct ContentView: View {
                         Circle()
                             .fill(viewModel.isConnected ? Color.green : Color.red)
                             .frame(width: 7, height: 7)
-                        Text(viewModel.isConnected ? "已连接" : "未连接")
+                        Text(cloudexLocalized(viewModel.isConnected ? "已连接" : "未连接"))
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                     .accessibilityElement(children: .combine)
-                    .accessibilityLabel(viewModel.isConnected ? "已连接" : "未连接")
+                    .accessibilityLabel(cloudexLocalized(viewModel.isConnected ? "已连接" : "未连接"))
                 }
                 .frame(maxWidth: 220)
             }
@@ -314,7 +314,7 @@ struct ContentView: View {
                     if isReady && viewModel.selectedThread == nil && content.messages.isEmpty {
                         VStack(spacing: 10) {
                             Spacer(minLength: 130)
-                            Text(viewModel.isCreatingNew ? "开始新对话" : "选择一个对话")
+                            Text(cloudexLocalized(viewModel.isCreatingNew ? "开始新对话" : "选择一个对话"))
                                 .font(.title2.bold())
                             Text(viewModel.selectedProject == nil
                                  ? "点击左上角菜单选择电脑上的项目和历史对话。"
@@ -390,8 +390,12 @@ struct ContentView: View {
                     }
 
                     if content.active {
-                        ProgressView()
-                            .frame(maxWidth: .infinity, alignment: .center)
+                        HStack(spacing: 0) {
+                            Spacer(minLength: 0)
+                            ProgressView()
+                            Spacer(minLength: 0)
+                        }
+                        .frame(maxWidth: .infinity)
                             .padding(.vertical, 8)
                     }
 
@@ -576,7 +580,7 @@ struct ContentView: View {
                         if viewModel.availableEfforts.isEmpty {
                             Text("默认")
                         } else {
-                            Picker("选择用量", selection: Binding(
+                            Picker("选择推理强度", selection: Binding(
                                 get: { viewModel.selectedEffortID },
                                 set: { viewModel.selectEffort($0) }
                             )) {
@@ -586,7 +590,7 @@ struct ContentView: View {
                             }
                         }
                     } label: {
-                        Label("用量", systemImage: "gauge.with.dots.needle.67percent")
+                        Label("推理强度", systemImage: "gauge.with.dots.needle.67percent")
                     }
                 } label: {
                     HStack(spacing: 5) {
@@ -606,7 +610,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.plain)
                 .liquidGlass(in: Capsule(), interactive: true)
-                .accessibilityLabel("切换模型和用量")
+                .accessibilityLabel("切换模型和推理强度")
 
                 Menu {
                     Picker("模式", selection: Binding(
@@ -619,16 +623,24 @@ struct ContentView: View {
                         }
                     }
                 } label: {
-                    Label(viewModel.codexMode.title, systemImage: viewModel.codexMode.systemImage)
-                        .font(.caption.weight(.medium))
-                        .lineLimit(1)
+                    ViewThatFits(in: .horizontal) {
+                        Label(viewModel.codexMode.title, systemImage: viewModel.codexMode.systemImage)
+                            .font(.caption.weight(.medium))
+                            .fixedSize(horizontal: true, vertical: false)
+
+                        Label(viewModel.codexMode.title, systemImage: viewModel.codexMode.systemImage)
+                            .font(.caption.weight(.medium))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(width: 120, alignment: .leading)
+                    }
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
-                        .fixedSize(horizontal: true, vertical: false)
                         .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
                 .liquidGlass(in: Capsule(), interactive: true)
+                .layoutPriority(0)
                 .accessibilityLabel("切换执行模式")
 
                 Spacer(minLength: 0)
@@ -646,6 +658,8 @@ struct ContentView: View {
                 }
                 .buttonStyle(.plain)
                 .liquidGlass(in: Capsule(), interactive: true)
+                .fixedSize(horizontal: true, vertical: false)
+                .layoutPriority(1)
                 .accessibilityLabel("查看本轮 Token 使用量")
             }
             .padding(.horizontal, 20)
@@ -681,7 +695,7 @@ struct ContentView: View {
             HStack(alignment: .bottom, spacing: 4) {
                 ZStack(alignment: .topLeading) {
                     if viewModel.draft.isEmpty {
-                        Text(viewModel.selectedThreadID == nil ? "向 Codex 发送新指令…" : "继续发送指令…")
+                        Text(cloudexLocalized(viewModel.selectedThreadID == nil ? "向 Codex 发送新指令…" : "继续发送指令…"))
                             .foregroundStyle(.tertiary)
                             .padding(.horizontal, 5)
                             .padding(.vertical, 10)
@@ -698,12 +712,13 @@ struct ContentView: View {
                     if viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         Button { Task { await viewModel.stop() } } label: {
                             Image(systemName: "stop.fill")
-                                .font(.caption)
-                                .foregroundStyle(.red)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.white)
                                 .frame(width: 40, height: 40)
                                 .contentShape(Circle())
                         }
                         .buttonStyle(.plain)
+                        .background(Color.black, in: Circle())
                         .disabled(viewModel.isBusy)
                         .accessibilityLabel("停止任务")
                     } else {
@@ -712,28 +727,30 @@ struct ContentView: View {
                         } label: {
                             Image(systemName: "arrow.up")
                                 .font(.body.bold())
-                                .foregroundStyle(.primary)
+                                .foregroundStyle(.white)
                                 .frame(width: 40, height: 40)
                                 .contentShape(Circle())
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("等待发送")
+                        .background(Color.black, in: Circle())
+                        .accessibilityLabel(cloudexLocalized("等待发送"))
                     }
                 } else {
                     Button { Task { await viewModel.send() } } label: {
                         Group {
                             if viewModel.isBusy {
-                                ProgressView().tint(.accentColor)
+                                ProgressView().tint(.white)
                             } else {
                                 Image(systemName: "arrow.up")
                                     .font(.body.bold())
-                                    .foregroundStyle(.primary)
+                                    .foregroundStyle(.white)
                             }
                         }
                         .frame(width: 40, height: 40)
                         .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
+                    .background(Color.black, in: Circle())
                     .disabled(viewModel.isBusy || viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     .accessibilityLabel("发送消息")
                 }
@@ -974,20 +991,20 @@ struct ContentView: View {
     }
 
     private func threadStatus(_ thread: CloudexThread) -> String {
-        if thread.status?.type == "active", thread.status?.activeFlags?.contains("waitingOnApproval") == true { return "等待审批" }
-        if thread.status?.type == "active" { return "运行中" }
-        if thread.status?.type == "idle" { return "已完成" }
-        if thread.status?.type == "notLoaded" { return "未加载" }
-        return thread.status?.type ?? "未知状态"
+        if thread.status?.type == "active", thread.status?.activeFlags?.contains("waitingOnApproval") == true { return cloudexLocalized("等待审批") }
+        if thread.status?.type == "active" { return cloudexLocalized("运行中") }
+        if thread.status?.type == "idle" { return cloudexLocalized("已完成") }
+        if thread.status?.type == "notLoaded" { return cloudexLocalized("未加载") }
+        return cloudexLocalized(thread.status?.type ?? "未知状态")
     }
 
     private var contextRemainingLabel: String {
         guard let usage = viewModel.selectedThread?.usage,
               let window = usage.modelContextWindow,
-              let used = usage.last?.totalTokens else { return "上下文" }
+              let used = usage.last?.totalTokens else { return cloudexLocalized("上下文") }
         let remaining = max(0, window - used)
         let percent = Int((Double(remaining) / Double(max(1, window)) * 100).rounded())
-        return "余 \(percent)%"
+        return cloudexLocalized("余 %lld%%", Int64(percent))
     }
 
     @ViewBuilder
@@ -1028,7 +1045,11 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .liquidGlass(in: Capsule(), interactive: true)
-        .accessibilityLabel(completed ? "任务已完成，点击查看最新对话" : "任务已用时 \(duration)")
+        .fixedSize(horizontal: true, vertical: false)
+        .layoutPriority(1)
+        .accessibilityLabel(completed
+            ? cloudexLocalized("任务已完成，点击查看最新对话")
+            : cloudexLocalized("任务已用时 %@", duration))
     }
 
     private func syncTaskTimerState() {
@@ -1077,7 +1098,7 @@ struct ContentView: View {
     }
 
     private func taskDurationText(at timestamp: Double) -> String {
-        guard let started = taskTimerStartedAt else { return "0秒" }
+        guard let started = taskTimerStartedAt else { return cloudexLocalized("%lld秒", Int64(0)) }
         return DateFormatting.duration(fromSeconds: max(0, timestamp - started))
     }
 }
@@ -1324,33 +1345,33 @@ private struct TokenUsageSheet: View {
         NavigationStack {
             List {
                 if let last = usage?.last {
-                    Section("本轮对话") {
-                        usageRow("输入 Token", value: last.inputTokens)
-                        usageRow("缓存输入", value: last.cachedInputTokens)
-                        usageRow("输出 Token", value: last.outputTokens)
-                        usageRow("推理输出", value: last.reasoningOutputTokens)
-                        usageRow("合计", value: last.totalTokens)
+                    Section(cloudexLocalized("本轮对话")) {
+                        usageRow(cloudexLocalized("输入 Token"), value: last.inputTokens)
+                        usageRow(cloudexLocalized("缓存输入"), value: last.cachedInputTokens)
+                        usageRow(cloudexLocalized("输出 Token"), value: last.outputTokens)
+                        usageRow(cloudexLocalized("推理输出"), value: last.reasoningOutputTokens)
+                        usageRow(cloudexLocalized("合计"), value: last.totalTokens)
                     }
                 }
                 if let total = usage?.total {
-                    Section("整段对话累计") {
-                        usageRow("输入 Token", value: total.inputTokens)
-                        usageRow("输出 Token", value: total.outputTokens)
-                        usageRow("合计", value: total.totalTokens)
+                    Section(cloudexLocalized("整段对话累计")) {
+                        usageRow(cloudexLocalized("输入 Token"), value: total.inputTokens)
+                        usageRow(cloudexLocalized("输出 Token"), value: total.outputTokens)
+                        usageRow(cloudexLocalized("合计"), value: total.totalTokens)
                     }
                 }
                 if let window = usage?.modelContextWindow {
-                    Section("上下文窗口") {
-                        usageRow("窗口大小", value: window)
+                    Section(cloudexLocalized("上下文窗口")) {
+                        usageRow(cloudexLocalized("窗口大小"), value: window)
                         let used = usage?.last?.totalTokens ?? 0
-                        usageRow("本轮剩余", value: max(0, window - used))
+                        usageRow(cloudexLocalized("本轮剩余"), value: max(0, window - used))
                     }
                 }
                 if usage?.last == nil && usage?.total == nil {
-                    ContentUnavailableView("暂无 Token 数据", systemImage: "chart.bar.xaxis")
+                    ContentUnavailableView(cloudexLocalized("暂无 Token 数据"), systemImage: "chart.bar.xaxis")
                 }
             }
-            .navigationTitle("Token 使用量")
+            .navigationTitle(cloudexLocalized("Token 使用量"))
             .navigationBarTitleDisplayMode(.inline)
         }
     }
@@ -1375,7 +1396,7 @@ private struct PendingSteerBubble: View {
             Spacer(minLength: 42)
 
             VStack(alignment: .leading, spacing: 8) {
-                Text("等待发送")
+                Text(cloudexLocalized("等待发送"))
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
 
@@ -1443,6 +1464,7 @@ private struct MessageBubble: View {
     let onFloatingProcessCollapse: () -> Void
     let onFloatingStateChange: (Bool) -> Void
     @State private var isPerformingAction = false
+    @State private var isErrorExpanded = false
 
     @ViewBuilder
     var body: some View {
@@ -1483,11 +1505,23 @@ private struct MessageBubble: View {
             Text(roleTitle)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(message.role == .error ? Color.red : Color.secondary)
-            MarkdownText(text: message.text, highlightQuery: highlightQuery)
-                .font(.body)
-                .foregroundStyle(message.role == .error ? Color.red : Color.primary)
-                .multilineTextAlignment(.leading)
-                .textSelection(.enabled)
+
+            if message.role == .error {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(message.text)
+                        .font(.body)
+                        .foregroundStyle(Color.red)
+                        .multilineTextAlignment(.leading)
+                        .textSelection(.enabled)
+                        .lineLimit(isErrorExpanded || !canExpandError ? nil : 2)
+                }
+            } else {
+                MarkdownText(text: message.text, highlightQuery: highlightQuery)
+                    .font(.body)
+                    .foregroundStyle(message.role == .error ? Color.red : Color.primary)
+                    .multilineTextAlignment(.leading)
+                    .textSelection(.enabled)
+            }
 
             messageFooter
         }
@@ -1502,16 +1536,20 @@ private struct MessageBubble: View {
         }
     }
 
+    private var canExpandError: Bool {
+        message.text.count > 100 || message.text.contains("\n")
+    }
+
     private var roleTitle: String {
         switch message.role {
-        case .user: return "你"
+        case .user: return cloudexLocalized("你")
         case .assistant: return "Codex"
-        case .error: return "错误"
-        case .system: return "系统"
-        case .execution: return "执行"
-        case .processSummary: return "过程"
+        case .error: return cloudexLocalized("错误")
+        case .system: return cloudexLocalized("系统")
+        case .execution: return cloudexLocalized("执行")
+        case .processSummary: return cloudexLocalized("过程")
         case .compressed: return "Compressed"
-        case .taskSummary: return "任务"
+        case .taskSummary: return cloudexLocalized("任务")
         }
     }
 
@@ -1531,6 +1569,20 @@ private struct MessageBubble: View {
             }
 
             Spacer(minLength: 10)
+
+            if message.role == .error && canExpandError {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        isErrorExpanded.toggle()
+                    }
+                } label: {
+                    Image(systemName: isErrorExpanded ? "chevron.up" : "chevron.down")
+                        .frame(width: 28, height: 24)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(cloudexLocalized(isErrorExpanded ? "收起" : "展开"))
+            }
 
             if message.role == .user || message.role == .assistant {
                 Button {
@@ -1717,11 +1769,11 @@ private struct ProcessSummaryBubble: View {
 
     private func processItemTitle(_ item: ChatMessage) -> String {
         switch item.role {
-        case .assistant: return "中间消息"
+        case .assistant: return cloudexLocalized("中间消息")
         case .compressed: return "Compressed"
         case .taskSummary: return "任务"
         case .system: return "系统"
-        case .error: return "错误"
+        case .error: return cloudexLocalized("错误")
         default: return "过程"
         }
     }
@@ -1798,6 +1850,19 @@ private struct MarkdownText: View {
                 case let .paragraph(value):
                     Text(Self.parseInline(value, highlightQuery: highlightQuery))
                         .frame(maxWidth: .infinity, alignment: .leading)
+                case let .list(items):
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(items) { item in
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text(item.marker)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                Text(Self.parseInline(item.text, highlightQuery: highlightQuery))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
                 case let .code(value, language):
                     MarkdownCodeBlock(source: value, language: language)
                 case let .table(rows):
@@ -1878,6 +1943,20 @@ private struct MarkdownText: View {
                 continue
             }
 
+            if let item = Self.listItem(from: line, id: blockID) {
+                flushParagraph()
+                var items = [item]
+                index += 1
+                while index < lines.count {
+                    let nextLine = lines[index]
+                    guard let nextItem = Self.listItem(from: nextLine, id: blockID + items.count) else { break }
+                    items.append(nextItem)
+                    index += 1
+                }
+                appendBlock(.list(items))
+                continue
+            }
+
             if Self.isIndentedCode(line) {
                 flushParagraph()
                 var codeLines: [String] = []
@@ -1917,6 +1996,34 @@ private struct MarkdownText: View {
 
     private static func isIndentedCode(_ line: String) -> Bool {
         line.hasPrefix("    ") || line.hasPrefix("\t")
+    }
+
+    private static func listItem(from line: String, id: Int) -> MarkdownListItem? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+
+        if let first = trimmed.first, ["-", "*", "+"].contains(first) {
+            let remainder = trimmed.dropFirst()
+            guard remainder.first?.isWhitespace == true else { return nil }
+            let text = remainder.trimmingCharacters(in: .whitespaces)
+            guard !text.isEmpty else { return nil }
+            return MarkdownListItem(id: id, marker: "•", text: text)
+        }
+
+        var digits = ""
+        var index = trimmed.startIndex
+        while index < trimmed.endIndex, trimmed[index].isNumber {
+            digits.append(trimmed[index])
+            index = trimmed.index(after: index)
+        }
+        guard !digits.isEmpty, index < trimmed.endIndex else { return nil }
+        let separator = trimmed[index]
+        guard separator == "." || separator == ")" else { return nil }
+        index = trimmed.index(after: index)
+        guard index < trimmed.endIndex, trimmed[index].isWhitespace else { return nil }
+        let text = trimmed[index...].trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { return nil }
+        return MarkdownListItem(id: id, marker: "\(digits).", text: text)
     }
 
     private static func isTableSeparator(_ line: String) -> Bool {
@@ -1994,12 +2101,19 @@ private struct AdaptiveConversationLayout: Layout {
 private struct MarkdownBlock: Identifiable {
     enum Content {
         case paragraph(String)
+        case list([MarkdownListItem])
         case code(String, String)
         case table([[String]])
     }
 
     let id: Int
     let content: Content
+}
+
+private struct MarkdownListItem: Identifiable {
+    let id: Int
+    let marker: String
+    let text: String
 }
 
 private struct MarkdownCodeBlock: View {
@@ -2190,8 +2304,10 @@ private struct ExecutionStepRow: View {
     private var detailText: String? {
         var values: [String] = []
         if let duration = message.executionDuration, !duration.isEmpty { values.append(duration) }
-        if message.executionStatus == "failed", let code = message.executionExitCode { values.append("退出码 \(code)") }
-        if message.executionStatus == "inProgress" { values.append("运行中") }
+        if message.executionStatus == "failed", let code = message.executionExitCode {
+            values.append(cloudexLocalized("退出码 %lld", Int64(code)))
+        }
+        if message.executionStatus == "inProgress" { values.append(cloudexLocalized("运行中")) }
         let time = DateFormatting.messageTime(from: message.createdAt)
         if !time.isEmpty { values.append(time) }
         return values.isEmpty ? nil : values.joined(separator: " · ")

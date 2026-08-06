@@ -1,0 +1,3 @@
+"CFBundleDisplayName" = "Cloudex";
+"NSCameraUsageDescription" = "Cloudex はカメラでサーバー接続 QR コードをスキャンし、アドレスと Token を自動入力します。";
+"NSLocalNetworkUsageDescription" = "Cloudex はコンピュータ上のローカル Codex コントロールサーバーへのアクセスを必要とします。";

@@ -63,6 +63,9 @@ struct CloudexRootView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
             keyboardHeight = 0
         }
+        .onReceive(NotificationCenter.default.publisher(for: .cloudexOpenNotificationSettings)) { _ in
+            showingSettings = true
+        }
         .sheet(isPresented: $showingSettings) {
             SettingsView(isPresented: $showingSettings)
                 .environmentObject(viewModel)
@@ -154,7 +157,7 @@ struct CloudexRootView: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("\(isProjectCollapsed(project) ? "展开" : "折叠")\(project.displayName)")
+                        .accessibilityLabel("\(cloudexLocalized(isProjectCollapsed(project) ? "展开" : "折叠"))\(project.displayName)")
                     }
                 }
 
@@ -165,8 +168,12 @@ struct CloudexRootView: View {
             }
             .refreshable { await viewModel.refresh() }
             .scrollDismissesKeyboard(.interactively)
-            .navigationTitle("对话")
-            .toolbar { rootToolbar }
+            .navigationTitle("Cloudex")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                rootToolbar
+                homeTitleToolbar
+            }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 conversationSearchBar
             }
@@ -218,9 +225,9 @@ struct CloudexRootView: View {
                             .toolbar(.visible, for: .navigationBar)
                         } else {
                             ContentUnavailableView(
-                                "选择一个对话",
+                                cloudexLocalized("选择一个对话"),
                                 systemImage: "bubble.left.and.bubble.right",
-                                description: Text("从左侧栏打开对话或创建新对话。")
+                                description: Text(cloudexLocalized("从左侧栏打开对话或创建新对话。"))
                             )
                         }
                     }
@@ -316,13 +323,17 @@ struct CloudexRootView: View {
                     .listRowBackground(Color.clear)
             }
         }
-        .refreshable { await viewModel.refresh() }
-        .scrollDismissesKeyboard(.interactively)
-        .navigationTitle("对话")
-        .toolbar { rootToolbar }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            conversationSearchBar(isWindowedIPad: windowed, bottomSafeArea: bottomSafeArea)
-        }
+            .refreshable { await viewModel.refresh() }
+            .scrollDismissesKeyboard(.interactively)
+            .navigationTitle("Cloudex")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                rootToolbar
+                homeTitleToolbar
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                conversationSearchBar(isWindowedIPad: windowed, bottomSafeArea: bottomSafeArea)
+            }
     }
 
     @ToolbarContentBuilder
@@ -338,6 +349,28 @@ struct CloudexRootView: View {
                 Image(systemName: "gearshape")
             }
             .accessibilityLabel("打开设置")
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var homeTitleToolbar: some ToolbarContent {
+        ToolbarItem(placement: .principal) {
+            VStack(spacing: 1) {
+                Text("Cloudex")
+                    .font(.headline)
+                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(viewModel.isConnected ? Color.green : Color.red)
+                        .frame(width: 7, height: 7)
+                    Text(cloudexLocalized(viewModel.isConnected ? "已连接" : "未连接"))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(cloudexLocalized(viewModel.isConnected ? "已连接" : "未连接"))
+            }
+            .frame(maxWidth: 220)
         }
     }
 
@@ -890,7 +923,7 @@ struct CloudexRootView: View {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
 
-                TextField("搜索对话", text: $searchQuery)
+                TextField(cloudexLocalized("搜索对话"), text: $searchQuery)
                     .focused($searchFieldFocused)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -1335,7 +1368,7 @@ private struct ProjectRow: View, Equatable {
                 Text(project.displayName)
                     .foregroundStyle(.primary)
                     .lineLimit(1)
-                Text("\(project.threads.count) 个对话")
+                Text(cloudexLocalized("%lld 个对话", Int64(project.threads.count)))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -1354,7 +1387,7 @@ private struct ThreadRow: View, Equatable {
                 .lineLimit(2)
             HStack(spacing: 6) {
                 if thread.isActive {
-                    Text("运行中")
+                    Text(cloudexLocalized("运行中"))
                         .foregroundStyle(.green)
                 }
                 Text(DateFormatting.string(from: thread.updatedAt))

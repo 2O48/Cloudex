@@ -668,8 +668,10 @@ struct CloudexRootView: View {
         viewModel.clearMessageJumpRequest()
         iPadSelectedProjectID = project.id
         if projectCWD == nil { viewModel.selectProject(nil) }
-        viewModel.startNewChat(projectCWD: projectCWD)
-        iPadSelectedThreadRoute = "new-\(UUID().uuidString)"
+        viewModel.startNewChat(projectCWD: projectCWD, clearProject: projectCWD == nil)
+        iPadSelectedThreadRoute = projectCWD == nil
+            ? "new-no-project-\(UUID().uuidString)"
+            : "new-\(UUID().uuidString)"
         iPadPreferredCompactColumn = .detail
         searchFieldFocused = false
     }
@@ -754,8 +756,11 @@ struct CloudexRootView: View {
             // passed nil. Clear it first so the “无项目” section really opens
             // an unscoped conversation instead of reusing the previous cwd.
             if projectCWD == nil { viewModel.selectProject(nil) }
-            viewModel.startNewChat(projectCWD: projectCWD)
-            navigationPath.append("new-\(UUID().uuidString)")
+            viewModel.startNewChat(projectCWD: projectCWD, clearProject: projectCWD == nil)
+            let route = projectCWD == nil
+                ? "new-no-project-\(UUID().uuidString)"
+                : "new-\(UUID().uuidString)"
+            navigationPath.append(route)
         } label: {
             Label("新对话", systemImage: "square.and.pencil")
                 .fontWeight(.semibold)

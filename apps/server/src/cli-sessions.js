@@ -6,6 +6,7 @@ import { config } from "./config.js";
 const SESSION_FILE_RE = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
 const ARCHIVE_FILE = path.join(config.stateDir, "archived-cli-threads.json");
 const SESSION_INDEX_FILE = path.join(os.homedir(), ".codex", "session_index.jsonl");
+const threadSummaryCache = new Map();
 let sessionIndexSignature = "";
 let sessionIndexNames = new Map();
 
@@ -642,9 +643,14 @@ export async function findSessionFiles(root = config.codexSessionsDir) {
   return results;
 }
 
-export async function readCliThread(filePath) {
+export async function readCliThread(filePath, { includeTurns = true } = {}) {
   const idFromPath = threadIdFromPath(filePath);
   const stat = await fs.stat(filePath);
+  const cacheKey = `${filePath}:${stat.mtimeMs}:${stat.size}`;
+  if (!includeTurns) {
+    const cached = threadSummaryCache.get(filePath);
+    if (cached?.key === cacheKey) return { thread: cached.thread, turns: [] };
+  }
   const state = {
     id: idFromPath,
     cwd: null,
@@ -700,9 +706,10 @@ export async function readCliThread(filePath) {
     gitInfo: null,
     name: state.name || null,
     usage: state.usage,
-    turns: state.turns,
+    ...(includeTurns ? { turns: state.turns } : {}),
   };
-  return { thread, turns: state.turns };
+  if (!includeTurns) threadSummaryCache.set(filePath, { key: cacheKey, thread });
+  return { thread, turns: includeTurns ? state.turns : [] };
 }
 
 export async function readArchiveSet() {
@@ -732,7 +739,7 @@ export async function archiveCliThread(threadId) {
 export async function listCliThreads({ archived = false } = {}) {
   const archiveSet = await readArchiveSet();
   const files = await findSessionFiles();
-  const settled = await Promise.allSettled(files.map((file) => readCliThread(file)));
+  const settled = await Promise.allSettled(files.map((file) => readCliThread(file, { includeTurns: false })));
   return settled
     .filter((item) => item.status === "fulfilled")
     .map((item) => item.value.thread)

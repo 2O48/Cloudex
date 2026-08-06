@@ -1,11 +1,18 @@
 import SwiftUI
 import gitdiff
 import UIKit
+import QuickLook
+import Foundation
 
 private enum ConversationSubpage: Hashable {
     case conversation
     case files
     case review
+}
+
+private struct OlderHistoryScrollSnapshot {
+    let offset: CGPoint
+    let contentHeight: CGFloat
 }
 
 struct ContentView: View {
@@ -47,6 +54,7 @@ struct ContentView: View {
     @State private var taskTimerHidden = true
     @FocusState private var composerFocused: Bool
     @State private var keyboardHeight: CGFloat = 0
+    @State private var olderHistoryScrollSnapshot: OlderHistoryScrollSnapshot?
 
     init(
         expectedThreadID: String? = nil,
@@ -56,6 +64,7 @@ struct ContentView: View {
         self.expectedThreadID = expectedThreadID
         self.onToggleDirectory = onToggleDirectory
         self.showsDirectoryButton = showsDirectoryButton
+        _isPreparingInitialLayout = State(initialValue: expectedThreadID?.hasPrefix("new-") != true)
     }
 
     var body: some View {
@@ -177,6 +186,9 @@ struct ContentView: View {
         }
         .toolbarBackground(.hidden, for: .navigationBar)
         .toolbar(.visible, for: .navigationBar)
+        .onAppear {
+            prepareNewChatRouteIfNeeded()
+        }
         .sheet(isPresented: $showingFilePicker) {
             RemoteFilePickerView(
                 isPresented: $showingFilePicker,
@@ -327,18 +339,6 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity)
                     }
 
-                    if isReady, let thread = viewModel.selectedThread {
-                        VStack(spacing: 4) {
-                            Text("\(threadStatus(thread)) · \(DateFormatting.string(from: thread.updatedAt))")
-                            Text(thread.cwd ?? "")
-                                .lineLimit(2)
-                        }
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.bottom, 4)
-                    }
-
                     ForEach(content.messages) { message in
                         MessageBubble(
                             message: message,
@@ -364,6 +364,17 @@ struct ContentView: View {
                             }
                         )
                         .id(message.id)
+                        .onAppear {
+                            guard message.id == content.messages.first?.id,
+                                  viewModel.hasMoreHistory,
+                                  !viewModel.isLoadingOlderTurns,
+                                  let offset = chatScrollController.currentContentOffset() else { return }
+                            olderHistoryScrollSnapshot = OlderHistoryScrollSnapshot(
+                                offset: offset,
+                                contentHeight: chatScrollController.contentSizeHeight()
+                            )
+                            Task { await viewModel.loadOlderTurns() }
+                        }
                     }
 
                     ForEach(content.approvals) { approval in
@@ -481,17 +492,32 @@ struct ContentView: View {
 
                     let explicitStillOwnsScroll = isExplicitScrollInProgress
                         && explicitScrollGeneration == generation
+                    if explicitStillOwnsScroll {
+                        // The button can be tapped while LazyVStack is still
+                        // materializing the newest rows. Re-anchor the bottom
+                        // sentinel first, then recompute UIScrollView's
+                        // content height several times as layout settles.
+                        let reconcileBottom = {
+                            guard scrollToBottomRequest == requestGeneration,
+                                  explicitScrollGeneration == generation,
+                                  isExplicitScrollInProgress else { return }
+                            var transaction = Transaction()
+                            transaction.disablesAnimations = true
+                            withTransaction(transaction) {
+                                proxy.scrollTo("chat-bottom", anchor: .bottom)
+                            }
+                            _ = chatScrollController.scrollToBottom(animated: true)
+                            isAtChatBottom = true
+                        }
+                        reconcileBottom()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: reconcileBottom)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: reconcileBottom)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.50, execute: reconcileBottom)
+                        return
+                    }
                     if !chatScrollController.scrollToBottom(animated: true) {
                         withAnimation(.easeOut(duration: 0.28)) {
                             proxy.scrollTo("chat-bottom", anchor: .bottom)
-                        }
-                    }
-                    if explicitStillOwnsScroll {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                            guard isExplicitScrollInProgress,
-                                  explicitScrollGeneration == generation,
-                                  scrollToBottomRequest == requestGeneration else { return }
-                            _ = chatScrollController.scrollToBottom(animated: true)
                         }
                     }
                 }
@@ -519,6 +545,20 @@ struct ContentView: View {
                     guard messagePositioningGeneration == generation else { return }
                     isMessagePositioningInProgress = false
                 }
+            }
+            .onChange(of: viewModel.isLoadingOlderTurns) { _, loading in
+                guard !loading, let snapshot = olderHistoryScrollSnapshot else { return }
+                olderHistoryScrollSnapshot = nil
+                let restore = {
+                    guard !viewModel.isLoadingOlderTurns else { return }
+                    let addedHeight = max(0, chatScrollController.contentSizeHeight() - snapshot.contentHeight)
+                    _ = chatScrollController.restoreContentOffset(
+                        CGPoint(x: snapshot.offset.x, y: snapshot.offset.y + addedHeight)
+                    )
+                }
+                DispatchQueue.main.async(execute: restore)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: restore)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: restore)
             }
         }
         .frame(maxHeight: .infinity)
@@ -777,6 +817,22 @@ struct ContentView: View {
         return isNewChat || expectedThreadID == viewModel.selectedThreadID
     }
 
+    private func prepareNewChatRouteIfNeeded() {
+        guard expectedThreadID?.hasPrefix("new-") == true else { return }
+        let isNoProjectRoute = expectedThreadID?.hasPrefix("new-no-project-") == true
+        // Navigation can render the destination before the sidebar action's
+        // state mutation has reached this view (especially in the iPad split
+        // view). Make the route authoritative so an in-flight old-thread
+        // loader cannot leave the new composer showing an endless spinner.
+        guard !viewModel.isCreatingNew || viewModel.selectedThreadID != nil else { return }
+        viewModel.startNewChat(
+            projectCWD: isNoProjectRoute ? nil : viewModel.selectedProjectCWD,
+            clearProject: isNoProjectRoute
+        )
+        resetChatLayoutForNewThread()
+        updateChatContent(force: true)
+    }
+
     private var currentChatContent: ChatScrollContent {
         guard isExpectedChatReady else { return .empty }
         return ChatScrollContent(
@@ -800,6 +856,13 @@ struct ContentView: View {
         if isPreparingInitialLayout {
             // Keep the hidden initial snapshot current while the first layout
             // settles. Do not enqueue another scroll for every streamed delta.
+            chatContentSnapshot = latest
+            return
+        }
+
+        if viewModel.isLoadingOlderTurns {
+            // Prepending history updates the rows without entering bottom
+            // follow mode. The native offset is restored after layout.
             chatContentSnapshot = latest
             return
         }
@@ -835,6 +898,14 @@ struct ContentView: View {
     }
 
     private func beginInitialBottomPositioning() {
+        // A new conversation has no history to measure or scroll. Revealing
+        // the empty composer immediately also avoids waiting on a ScrollView
+        // layout pass that may never report a usable bottom offset.
+        if expectedThreadID?.hasPrefix("new-") == true {
+            isInitialBottomScrollInProgress = false
+            isPreparingInitialLayout = false
+            return
+        }
         initialBottomScrollGeneration += 1
         let generation = initialBottomScrollGeneration
         isInitialBottomScrollInProgress = true
@@ -870,7 +941,7 @@ struct ContentView: View {
         chatContentSnapshot = .empty
         hasLoadedChatContent = false
         isStaticConversationLocked = false
-        isPreparingInitialLayout = true
+        isPreparingInitialLayout = expectedThreadID?.hasPrefix("new-") != true
         isInitialBottomScrollInProgress = false
         isMessagePositioningInProgress = false
         isProcessLayoutChangeInProgress = false
@@ -918,13 +989,18 @@ struct ContentView: View {
             return
         }
         isFollowingChatBottom = true
-        isAtChatBottom = true
     }
 
     private func beginExplicitScroll() {
         explicitScrollGeneration += 1
         let generation = explicitScrollGeneration
         isExplicitScrollInProgress = true
+        // A button tap can arrive while UIScrollView is still decelerating.
+        // Cancel that native motion before changing follow state; otherwise
+        // the scroll-phase callback can leave isUserScrollingChat=true and
+        // the bottom request will be rejected until the deceleration ends.
+        chatScrollController.cancelCurrentScroll()
+        isUserScrollingChat = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
             guard explicitScrollGeneration == generation else { return }
             isExplicitScrollInProgress = false
@@ -988,14 +1064,6 @@ struct ContentView: View {
               viewModel.renderedMessages.contains(where: { $0.id == request.messageID }) else { return }
         viewModel.clearMessageJumpRequest()
         showMessage(request.messageID, highlightQuery: request.query)
-    }
-
-    private func threadStatus(_ thread: CloudexThread) -> String {
-        if thread.status?.type == "active", thread.status?.activeFlags?.contains("waitingOnApproval") == true { return cloudexLocalized("等待审批") }
-        if thread.status?.type == "active" { return cloudexLocalized("运行中") }
-        if thread.status?.type == "idle" { return cloudexLocalized("已完成") }
-        if thread.status?.type == "notLoaded" { return cloudexLocalized("未加载") }
-        return cloudexLocalized(thread.status?.type ?? "未知状态")
     }
 
     private var contextRemainingLabel: String {
@@ -1140,6 +1208,11 @@ private final class ChatScrollController: ObservableObject {
         return scrollView.contentOffset
     }
 
+    func contentSizeHeight() -> CGFloat {
+        scrollView?.layoutIfNeeded()
+        return scrollView?.contentSize.height ?? 0
+    }
+
     @discardableResult
     func restoreContentOffset(_ offset: CGPoint) -> Bool {
         guard let scrollView, scrollView.window != nil else { return false }
@@ -1177,10 +1250,8 @@ private final class ChatScrollController: ObservableObject {
                 - scrollView.bounds.height
                 + scrollView.adjustedContentInset.bottom
         )
-        scrollView.setContentOffset(
-            CGPoint(x: scrollView.contentOffset.x, y: maximumY),
-            animated: animated
-        )
+        let target = CGPoint(x: scrollView.contentOffset.x, y: maximumY)
+        scrollView.setContentOffset(target, animated: animated)
         return true
     }
 
@@ -1465,6 +1536,9 @@ private struct MessageBubble: View {
     let onFloatingStateChange: (Bool) -> Void
     @State private var isPerformingAction = false
     @State private var isErrorExpanded = false
+    @State private var previewItem: EditPreviewItem?
+    @State private var previewLoadingPath: String?
+    @State private var previewError: String?
 
     @ViewBuilder
     var body: some View {
@@ -1486,6 +1560,33 @@ private struct MessageBubble: View {
                 messageContent
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .sheet(item: $previewItem) { item in
+                NavigationStack {
+                    Group {
+                        if let code = item.code {
+                            CodePreviewView(source: code, fileName: item.name)
+                        } else {
+                            EditQuickLookPreview(url: item.url)
+                        }
+                    }
+                    .navigationTitle(item.name)
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button(cloudexLocalized("完成")) { previewItem = nil }
+                        }
+                    }
+                }
+                .presentationDragIndicator(.visible)
+            }
+            .alert(cloudexLocalized("无法预览文件"), isPresented: Binding(
+                get: { previewError != nil },
+                set: { if !$0 { previewError = nil } }
+            )) {
+                Button(cloudexLocalized("好"), role: .cancel) {}
+            } message: {
+                Text(previewError ?? cloudexLocalized("未知错误"))
+            }
         } else {
             HStack {
                 if message.role == .user { Spacer(minLength: 42) }
@@ -1516,11 +1617,22 @@ private struct MessageBubble: View {
                         .lineLimit(isErrorExpanded || !canExpandError ? nil : 2)
                 }
             } else {
-                MarkdownText(text: message.text, highlightQuery: highlightQuery)
+                MarkdownText(
+                    text: message.text,
+                    highlightQuery: highlightQuery,
+                    onFileLink: message.role == .assistant ? { url in previewFile(url) } : nil
+                )
                     .font(.body)
                     .foregroundStyle(message.role == .error ? Color.red : Color.primary)
                     .multilineTextAlignment(.leading)
                     .textSelection(.enabled)
+            }
+
+            if message.role == .assistant,
+               let editDiff = message.editDiff,
+               !editDiff.isEmpty {
+                EditSummaryCard(payloads: editDiff)
+                    .padding(.top, 5)
             }
 
             messageFooter
@@ -1538,6 +1650,42 @@ private struct MessageBubble: View {
 
     private var canExpandError: Bool {
         message.text.count > 100 || message.text.contains("\n")
+    }
+
+    private func previewFile(_ url: URL) {
+        guard url.scheme == nil || url.isFileURL else { return }
+        guard previewLoadingPath == nil else { return }
+
+        var path = (url.isFileURL ? url.path : (url.path.isEmpty ? url.absoluteString : url.path))
+            .removingPercentEncoding ?? url.absoluteString
+        if !path.hasPrefix("/"), let root = viewModel.selectedProjectCWD ?? viewModel.selectedThread?.cwd,
+           !root.isEmpty {
+            path = URL(fileURLWithPath: root, isDirectory: true)
+                .appendingPathComponent(path)
+                .path
+        }
+
+        previewLoadingPath = path
+        Task {
+            do {
+                let data = try await viewModel.previewFile(path: path)
+                let name = (path as NSString).lastPathComponent
+                let directory = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("CloudexPreviews", isDirectory: true)
+                    .appendingPathComponent(UUID().uuidString, isDirectory: true)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let localURL = directory.appendingPathComponent(name)
+                try data.write(to: localURL, options: .atomic)
+                previewItem = EditPreviewItem(
+                    name: name,
+                    url: localURL,
+                    code: CodePreviewFile.supports(fileName: name) ? CodePreviewFile.decode(data) : nil
+                )
+            } catch {
+                previewError = error.localizedDescription
+            }
+            previewLoadingPath = nil
+        }
     }
 
     private var roleTitle: String {
@@ -1652,11 +1800,15 @@ private struct ProcessSummaryBubble: View {
                 Button {
                     if expanded {
                         onInteraction(false)
-                        expanded = false
-                        expansionGeneration += 1
+                        withAnimation(.easeInOut(duration: 0.3)) {
+                            expanded = false
+                            expansionGeneration += 1
+                        }
                     } else if message.processDetailsLoaded {
                         onInteraction(true)
-                        expanded = true
+                        withAnimation(.easeInOut(duration: 0.3)) {
+                            expanded = true
+                        }
                     } else if let turnID = message.sourceTurnID, !loadingDetails {
                         loadingDetails = true
                         Task {
@@ -1664,18 +1816,17 @@ private struct ProcessSummaryBubble: View {
                             loadingDetails = false
                             if loaded {
                                 onInteraction(true)
-                                expanded = true
+                                withAnimation(.easeInOut(duration: 0.3)) {
+                                    expanded = true
+                                }
                             }
                         }
                     }
                 } label: {
                     HStack(spacing: 8) {
-                        if loadingDetails {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Image(systemName: expanded ? "chevron.down.circle.fill" : "chevron.right.circle.fill")
-                                .foregroundStyle(.secondary)
-                        }
+                        Image(systemName: "chevron.right.circle.fill")
+                            .foregroundStyle(.secondary)
+                            .rotationEffect(.degrees(expanded ? 90 : 0))
                         MarkdownText(text: message.text)
                             .font(.body.weight(.semibold))
                             .foregroundStyle(.secondary)
@@ -1721,6 +1872,7 @@ private struct ProcessSummaryBubble: View {
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.opacity.combined(with: .offset(y: -10)))
                     .background {
                         GeometryReader { geometry in
                             Color.clear.preference(key: ProcessContentHeightKey.self, value: geometry.size.height)
@@ -1758,8 +1910,10 @@ private struct ProcessSummaryBubble: View {
         .onChange(of: collapseRequest) { _, _ in
             guard expanded else { return }
             onFloatingCollapse()
-            expanded = false
-            expansionGeneration += 1
+            withAnimation(.easeInOut(duration: 0.3)) {
+                expanded = false
+                expansionGeneration += 1
+            }
             onFloatingStateChange(false)
         }
         .onDisappear {
@@ -1785,6 +1939,166 @@ private struct ProcessSummaryBubble: View {
 
     private func updateFloatingState() {
         onFloatingStateChange(expanded && shouldShowFloatingCollapse && bubbleVisible && !collapseButtonVisible)
+    }
+}
+
+private struct EditSummaryCard: View {
+    let payloads: [EditDiffPayload]
+    @State private var showingReview = false
+
+    private var additions: Int {
+        payloads.reduce(0) { total, payload in
+            total + (payload.additions ?? payload.lines?.filter { $0.kind == "addition" }.count ?? 0)
+        }
+    }
+
+    private var deletions: Int {
+        payloads.reduce(0) { total, payload in
+            total + (payload.deletions ?? payload.lines?.filter { $0.kind == "deletion" }.count ?? 0)
+        }
+    }
+
+    private var fileNames: String {
+        let names = payloads.map { displayName($0.name) }
+        if names.count <= 3 { return names.joined(separator: ", ") }
+        return "\(names.prefix(3).joined(separator: ", ")) + \(names.count - 3)"
+    }
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "doc.badge.plus")
+                .font(.title3.weight(.medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 54, height: 54)
+                .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(cloudexLocalized("已编辑 %@", fileNames))
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                HStack(spacing: 6) {
+                    Text("+\(additions)").foregroundStyle(.green)
+                    Text("-\(deletions)").foregroundStyle(.red)
+                }
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            Button { showingReview = true } label: {
+                Image(systemName: "doc.text.magnifyingglass")
+                    .font(.body.weight(.medium))
+                    .frame(width: 34, height: 34)
+            }
+            .buttonStyle(.bordered)
+            .accessibilityLabel(cloudexLocalized("审核修改"))
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .stroke(Color(.separator).opacity(0.45), lineWidth: 0.6)
+        }
+        .sheet(isPresented: $showingReview) {
+            TurnReviewSheet(payloads: payloads)
+        }
+    }
+
+    private func displayName(_ value: String) -> String {
+        let name = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return "files" }
+        return (name as NSString).lastPathComponent
+    }
+
+}
+
+private struct EditPreviewItem: Identifiable {
+    let id = UUID()
+    let name: String
+    let url: URL
+    let code: String?
+}
+
+private struct EditQuickLookPreview: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeCoordinator() -> Coordinator { Coordinator(url: url) }
+
+    func makeUIViewController(context: Context) -> QLPreviewController {
+        let controller = QLPreviewController()
+        controller.dataSource = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ controller: QLPreviewController, context: Context) {
+        context.coordinator.url = url
+        controller.reloadData()
+    }
+
+    final class Coordinator: NSObject, QLPreviewControllerDataSource {
+        var url: URL
+
+        init(url: URL) { self.url = url }
+
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+
+        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
+            url as NSURL
+        }
+    }
+}
+
+private struct TurnReviewSheet: View {
+    let payloads: [EditDiffPayload]
+    @Environment(\.dismiss) private var dismiss
+
+    private var totalAdditions: Int {
+        payloads.reduce(0) { total, payload in
+            total + (payload.additions ?? payload.lines?.filter { $0.kind == "addition" }.count ?? 0)
+        }
+    }
+
+    private var totalDeletions: Int {
+        payloads.reduce(0) { total, payload in
+            total + (payload.deletions ?? payload.lines?.filter { $0.kind == "deletion" }.count ?? 0)
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "arrow.triangle.branch")
+                            .foregroundStyle(.secondary)
+                        Text(cloudexLocalized("本轮修改"))
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text("+\(totalAdditions)")
+                            .foregroundStyle(.green)
+                        Text("-\(totalDeletions)")
+                            .foregroundStyle(.red)
+                    }
+                    .font(.caption2.monospacedDigit())
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(Color(.tertiarySystemBackground))
+
+                    CodexStyleDiffRenderer(payloads: payloads, expanded: true)
+                }
+                .padding(12)
+            }
+            .navigationTitle(cloudexLocalized("审核修改"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(cloudexLocalized("完成")) { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
     }
 }
 
@@ -1842,6 +2156,7 @@ private struct SystemTimelineBubble: View {
 private struct MarkdownText: View {
     let text: String
     var highlightQuery: String? = nil
+    var onFileLink: ((URL) -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1871,6 +2186,11 @@ private struct MarkdownText: View {
             }
         }
         .fixedSize(horizontal: false, vertical: true)
+        .environment(\.openURL, OpenURLAction { url in
+            guard let onFileLink else { return .systemAction }
+            onFileLink(url)
+            return .handled
+        })
     }
 
     private static func parseInline(_ text: String, highlightQuery: String?) -> AttributedString {

@@ -85,7 +85,12 @@ final class LocalConversationCache {
                 detailsLoaded: processItemCount == 0
             )
         }
-        return ThreadDetail(thread: detail.thread, turns: turns, hasMoreBefore: false, nextBefore: nil)
+        return ThreadDetail(
+            thread: detail.thread,
+            turns: turns,
+            hasMoreBefore: detail.hasMoreBefore,
+            nextBefore: detail.nextBefore
+        )
     }
 
     private func threadFileURL(_ threadID: String) -> URL {

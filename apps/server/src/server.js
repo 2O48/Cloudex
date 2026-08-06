@@ -919,7 +919,7 @@ async function syncThreads(reason = "manual") {
 
 function startThreadSync() {
   scheduleThreadSync("startup", 0);
-  syncInterval = setInterval(() => scheduleThreadSync("poll", 0), 1000);
+  syncInterval = setInterval(() => scheduleThreadSync("poll", 0), 3000);
 }
 
 function stopThreadSync() {
@@ -1104,10 +1104,8 @@ async function handle(req, res, url) {
   if (req.method === "GET" && detailMatch) {
     const threadId = decodeURIComponent(detailMatch[1]);
     const rawLimit = url.searchParams.get("limit");
-    const requestedLimit = rawLimit === null ? Number.MAX_SAFE_INTEGER : Number.parseInt(rawLimit, 10);
-    const limit = rawLimit === null
-      ? Number.MAX_SAFE_INTEGER
-      : (Number.isFinite(requestedLimit) ? Math.min(20, Math.max(1, requestedLimit)) : 3);
+    const requestedLimit = rawLimit === null ? 12 : Number.parseInt(rawLimit, 10);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(20, Math.max(1, requestedLimit)) : 12;
     const before = url.searchParams.get("before") || null;
     const around = url.searchParams.get("around") || null;
     const result = await readThreadDetail(threadId, { limit, before, around });
@@ -1166,12 +1164,13 @@ async function handle(req, res, url) {
 
   if (req.method === "POST" && url.pathname === "/api/threads") {
     const data = await body(req);
-    const cwd = await normalizeThreadCwd(data.cwd || config.defaultCwd);
+    const noProject = data.noProject === true || data.cwd === NO_PROJECT_CWD;
+    const cwd = noProject ? null : await normalizeThreadCwd(data.cwd || config.defaultCwd);
     let thread = null;
     let turn = null;
     if (usesWindowsCliFallback()) {
       const threadId = await startWindowsThread({
-        cwd,
+        cwd: cwd || config.defaultCwd,
         prompt: data.prompt,
         files: data.files,
         model: data.model || null,
@@ -1184,13 +1183,13 @@ async function handle(req, res, url) {
       thread = (await readCliThreadById(threadId)).thread;
     } else {
       const params = {
-        cwd,
         model: data.model || null,
         sandbox: data.sandbox || "workspace-write",
         approvalPolicy: data.approvalPolicy || "on-request",
         approvalsReviewer: data.approvalsReviewer || "user",
         personality: data.personality || null,
       };
+      if (cwd) params.cwd = cwd;
       const result = await client.request("thread/start", params);
       thread = result.thread || result;
       // thread/start automatically subscribes this app-server connection. Record

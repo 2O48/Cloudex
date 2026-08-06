@@ -4,10 +4,8 @@
     {
       "layers" : [
         {
-          "fill" : "automatic",
-          "glass" : true,
-          "image-name" : "cloudex->_.png",
-          "name" : "cloudex->_"
+          "image-name" : "cloudex-item.png",
+          "name" : "cloudex-item"
         },
         {
           "blend-mode" : "normal",

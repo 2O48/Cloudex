@@ -8,7 +8,7 @@ import { isPathInside, normalizeAllowedPath } from "../src/file-roots.js";
 
 test("project has a package and a safe default workspace root", async () => {
   const packageJson = await import("../package.json", { with: { type: "json" } });
-  assert.equal(packageJson.default.name, "@cloudex/server");
+  assert.equal(packageJson.default.name, "cloudex");
   assert.equal(path.isAbsolute(process.cwd()), true);
 });
 

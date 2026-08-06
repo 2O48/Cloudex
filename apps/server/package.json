@@ -1,10 +1,19 @@
 {
-  "name": "@cloudex/server",
+  "name": "cloudex",
   "version": "0.1.0",
-  "private": true,
+  "description": "Cloudex local controller: pair your phone, serve the API, and control the Codex CLI.",
   "type": "module",
+  "bin": {
+    "cloudex": "./bin/cloudex.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
   "scripts": {
     "start": "node src/server.js",
+    "cli": "node bin/cloudex.js",
     "dev": "node --watch src/server.js",
     "test": "node --test test/*.test.js"
   },

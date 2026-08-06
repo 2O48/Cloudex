@@ -12,7 +12,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   AUTH_TOKEN  API 访问 Bearer Token；省略时复用或生成项目内持久化 Token。
   CLOUDEX_AUTH_TOKEN_FILE  Token 文件路径；默认是项目目录下的 .cloudex-state/auth-token。
   HOST        Cloudex 监听地址，默认 0.0.0.0。
-  PORT        Cloudex 监听端口，默认 8787。
+  PORT        Cloudex 监听端口，默认 8890。
   CODEX_BIN   Codex CLI 路径；默认使用 PATH 中的 codex。
 EOF
   exit 0
@@ -22,7 +22,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CODEX_BIN="${CODEX_BIN:-$(command -v codex 2>/dev/null || true)}"
 CODEX_BIN="${CODEX_BIN:-$HOME/.codex/packages/standalone/current/bin/codex}"
 HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-8787}"
+PORT="${PORT:-8890}"
 AUTH_TOKEN_FILE="${CLOUDEX_AUTH_TOKEN_FILE:-$PROJECT_DIR/.cloudex-state/auth-token}"
 
 if [[ ! -x "$CODEX_BIN" ]]; then

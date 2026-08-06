@@ -15,12 +15,12 @@
 
 ## 运行
 
-1. 先在项目根目录运行 `./start-cloudex.sh`，确保本地服务器的 `8787` 端口可访问。
+1. 先在项目根目录运行 `./start-cloudex.sh`，确保本地服务器的 `8890` 端口可访问。
 2. 用本机可用的 `Xcode-beta.app` 打开 `CloudexNative.xcodeproj`。
 3. 选择模拟器或已签名的真机，运行 `CloudexNative` Scheme。
 4. 在 App 右上角设置中填写：
-   - 局域网：`http://电脑局域网IP:8787`
-   - Tailscale：`http://电脑TailscaleIP:8787`
+   - 局域网：`http://电脑局域网IP:8890`
+   - Tailscale：`http://电脑TailscaleIP:8890`
    - 启动脚本终端中显示的访问 Token
 
 真机不能使用 `127.0.0.1` 访问电脑。项目已在 `Info.plist` 中声明本地网络用途并允许开发阶段的 HTTP 连接。

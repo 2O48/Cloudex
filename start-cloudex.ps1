@@ -1,6 +1,6 @@
 param(
   [switch]$Background,
-  [int]$Port = 8787,
+  [int]$Port = 8890,
   [string]$ListenHost = "0.0.0.0",
   [string]$FileRoots = ""
 )

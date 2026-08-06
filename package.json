@@ -14,6 +14,8 @@
   "scripts": {
     "start": "npm run server",
     "server": "node apps/server/src/server.js",
+    "cli": "node apps/server/bin/cloudex.js",
+    "pack:server": "npm pack --workspace apps/server",
     "server:dev": "node --watch apps/server/src/server.js",
     "dev:all": "bash ./start-cloudex.sh",
     "test": "node --test apps/server/test/*.test.js"

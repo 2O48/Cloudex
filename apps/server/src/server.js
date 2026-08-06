@@ -2,6 +2,7 @@ import http from "node:http";
 import os from "node:os";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { config } from "./config.js";
@@ -1374,7 +1375,7 @@ const server = http.createServer((req, res) => {
   handle(req, res, url).catch((error) => errorResponse(res, error));
 });
 
-async function main() {
+export async function startServer() {
   if (!config.isLoopback && !config.authToken) {
     throw new Error("HOST is not loopback; set AUTH_TOKEN before exposing the controller");
   }
@@ -1400,9 +1401,12 @@ async function main() {
 process.on("SIGINT", async () => { stopThreadSync(); await client.stop(); server.close(); process.exit(0); });
 process.on("SIGTERM", async () => { stopThreadSync(); await client.stop(); server.close(); process.exit(0); });
 
-main().catch((error) => {
-  console.error(error.message);
-  stopThreadSync();
-  client.stop().catch(() => {});
-  process.exitCode = 1;
-});
+const entrypoint = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";
+if (import.meta.url === entrypoint) {
+  startServer().catch((error) => {
+    console.error(error.message);
+    stopThreadSync();
+    client.stop().catch(() => {});
+    process.exitCode = 1;
+  });
+}

@@ -48,7 +48,7 @@ const fileRoots = (process.env.FILE_ROOTS || process.cwd())
 
 export const config = {
   host,
-  port: Number(process.env.PORT || 8787),
+  port: Number(process.env.PORT || 8890),
   authToken,
   codexBin: process.env.CODEX_BIN || defaultCodexBin,
   codexConfigPath: process.env.CODEX_CONFIG_PATH

@@ -68,29 +68,21 @@ final class AppViewModel: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
-        let savedServerURL = defaults.string(forKey: "cloudex.serverURL") ?? ""
         let savedLANURL = defaults.string(forKey: "cloudex.lanServerURL") ?? ""
         let savedTailscaleURL = defaults.string(forKey: "cloudex.tailscaleServerURL") ?? ""
         let savedToken = defaults.string(forKey: "cloudex.authToken") ?? ""
-#if targetEnvironment(simulator)
-        let defaultLANURL = "http://127.0.0.1:8787"
-#else
-        let defaultLANURL = savedServerURL.isEmpty || savedServerURL.contains("127.0.0.1") || savedServerURL.contains("localhost")
-            ? "http://192.168.31.104:8787"
-            : savedServerURL
-#endif
-        let initialLANURL = savedLANURL.isEmpty ? defaultLANURL : savedLANURL
-        let initialTailscaleURL = savedTailscaleURL.isEmpty || savedTailscaleURL.contains("2o48demac-mini.tail83d612.ts.net")
-            ? "http://100.68.96.121:8787"
-            : savedTailscaleURL
+        // 不内置任何开发机地址：默认只指向本机回环地址，
+        // 真实服务器地址通过设置页填写或扫描配对二维码获取。
+        let defaultServerURL = "http://127.0.0.1:8890"
+        let initialLANURL = savedLANURL.isEmpty ? defaultServerURL : savedLANURL
+        let initialTailscaleURL = savedTailscaleURL.isEmpty ? defaultServerURL : savedTailscaleURL
         let initialConnectionMode = ConnectionMode(rawValue: defaults.string(forKey: "cloudex.connectionMode") ?? "") ?? .automatic
         lanServerURL = initialLANURL
         tailscaleServerURL = initialTailscaleURL
         connectionMode = initialConnectionMode
         serverURL = initialConnectionMode == .tailscale ? initialTailscaleURL : initialLANURL
-        authToken = savedToken.isEmpty || savedToken == "lW0FcVb_finDkfBpW0wHKtGh6lmAXw1t"
-            ? "GASPMZC_06BAFN2o0T9rY3BNTtAhsVTu"
-            : savedToken
+        // 不内置任何开发期 Token：认证信息只来自已保存值或扫码配对。
+        authToken = savedToken
         // The Codex CLI config is authoritative on each launch. An in-app
         // selection still applies for the current run and subsequent turns.
         selectedModelID = ""

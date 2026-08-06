@@ -109,6 +109,17 @@ struct CloudexRootView: View {
     private var phoneNavigation: some View {
         NavigationStack(path: $navigationPath) {
             List {
+                if !pinnedConversations.isEmpty {
+                    Section("置顶") {
+                        ForEach(pinnedConversations) { pinned in
+                            conversationButton(
+                                pinned.thread,
+                                projectCWD: pinned.projectCWD
+                            )
+                        }
+                    }
+                }
+
                 ForEach(filteredProjects) { project in
                     Section {
                         if !isProjectCollapsed(project) {
@@ -252,6 +263,15 @@ struct CloudexRootView: View {
 
     private func iPadSidebarColumn(windowed: Bool, bottomSafeArea: CGFloat) -> some View {
         List {
+            if !pinnedConversations.isEmpty {
+                Section("置顶") {
+                    ForEach(pinnedConversations) { pinned in
+                        iPadConversationButton(pinned.thread, project: pinned.project)
+                            .listRowBackground(iPadSelectionRowBackground(for: pinned.thread.id))
+                    }
+                }
+            }
+
             ForEach(iPadSidebarProjects) { project in
                 Section {
                     if !isProjectCollapsed(project) {
@@ -334,6 +354,16 @@ struct CloudexRootView: View {
                     }
                 }
 
+                let projectPinnedConversations = pinnedConversations.filter { $0.project.id == project.id }
+                if !projectPinnedConversations.isEmpty {
+                    Section("置顶") {
+                        ForEach(projectPinnedConversations) { pinned in
+                            iPadConversationButton(pinned.thread, project: project)
+                                .listRowBackground(iPadSelectionRowBackground(for: pinned.thread.id))
+                        }
+                    }
+                }
+
                 Section("对话") {
                     ForEach(iPadVisibleThreads) { thread in
                         VStack(alignment: .leading, spacing: 0) {
@@ -392,10 +422,11 @@ struct CloudexRootView: View {
         return viewModel.projects.compactMap { project in
             let threads = project.threads
                 .filter { thread in
-                    query.isEmpty
+                    !viewModel.isPinned(thread.id)
+                        && (query.isEmpty
                         || matchesByThreadID[thread.id]?.isEmpty == false
                         || [thread.title, thread.preview ?? "", thread.cwd ?? "", project.displayName]
-                            .contains { $0.localizedCaseInsensitiveContains(query) }
+                            .contains { $0.localizedCaseInsensitiveContains(query) })
                 }
                 .sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
             guard !threads.isEmpty else { return nil }
@@ -429,10 +460,11 @@ struct CloudexRootView: View {
         return iPadProjects.compactMap { project in
             let threads = project.threads
                 .filter { thread in
-                    query.isEmpty
+                    !viewModel.isPinned(thread.id)
+                        && (query.isEmpty
                         || matchesByThreadID[thread.id]?.isEmpty == false
                         || [thread.title, thread.preview ?? "", thread.cwd ?? "", project.displayName]
-                            .contains { $0.localizedCaseInsensitiveContains(query) }
+                            .contains { $0.localizedCaseInsensitiveContains(query) })
                 }
                 .sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
             guard query.isEmpty || !threads.isEmpty else { return nil }
@@ -459,12 +491,33 @@ struct CloudexRootView: View {
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         return project.threads
             .filter { thread in
-                query.isEmpty
+                !viewModel.isPinned(thread.id)
+                    && (query.isEmpty
                     || matchesByThreadID[thread.id]?.isEmpty == false
                     || [thread.title, thread.preview ?? "", thread.cwd ?? "", project.displayName]
-                        .contains { $0.localizedCaseInsensitiveContains(query) }
+                        .contains { $0.localizedCaseInsensitiveContains(query) })
             }
             .sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
+    }
+
+    private var pinnedConversations: [PinnedConversation] {
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        return viewModel.projects
+            .flatMap { project in
+                project.threads.map { PinnedConversation(project: project, thread: $0) }
+            }
+            .filter { pinned in
+                viewModel.isPinned(pinned.thread.id)
+                    && (query.isEmpty
+                        || matchesByThreadID[pinned.thread.id]?.isEmpty == false
+                        || [
+                            pinned.thread.title,
+                            pinned.thread.preview ?? "",
+                            pinned.thread.cwd ?? "",
+                            pinned.project.displayName,
+                        ].contains { $0.localizedCaseInsensitiveContains(query) })
+            }
+            .sorted { ($0.thread.updatedAt ?? 0) > ($1.thread.updatedAt ?? 0) }
     }
 
     private func iPadProjectButton(_ project: CloudexProject) -> some View {
@@ -504,6 +557,9 @@ struct CloudexRootView: View {
             } label: {
                 Label("归档", systemImage: "archivebox")
             }
+        }
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            pinButton(thread)
         }
     }
 
@@ -699,6 +755,21 @@ struct CloudexRootView: View {
                 Label("归档", systemImage: "archivebox")
             }
         }
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            pinButton(thread)
+        }
+    }
+
+    private func pinButton(_ thread: CloudexThread) -> some View {
+        Button {
+            viewModel.togglePinned(thread.id)
+        } label: {
+            Label(
+                viewModel.isPinned(thread.id) ? "取消置顶" : "置顶",
+                systemImage: viewModel.isPinned(thread.id) ? "pin.slash" : "pin"
+            )
+        }
+        .tint(.orange)
     }
 
     private func searchMatchButton(
@@ -861,6 +932,16 @@ struct CloudexRootView: View {
         .animation(.easeInOut(duration: 0.2), value: searchFieldFocused)
     }
 
+}
+
+private struct PinnedConversation: Identifiable, Equatable {
+    let project: CloudexProject
+    let thread: CloudexThread
+
+    var id: String { thread.id }
+    var projectCWD: String? {
+        project.isNoProjectLike ? nil : project.cwd
+    }
 }
 
 private struct SearchFieldSurface: ViewModifier {

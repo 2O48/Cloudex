@@ -23,8 +23,6 @@ const globalSubscribers = new Set();
 const eventHistory = new Map();
 const pendingApprovals = new Map();
 const EVENT_HISTORY_LIMIT = 250;
-const MODELS_CACHE_FILE = process.env.CLOUDEX_MODELS_CACHE
-  || path.join(os.homedir(), ".codex", "models_cache.json");
 const APPROVAL_HISTORY_FILE = path.join(config.stateDir, "approval-history.json");
 let approvalHistory = null;
 let approvalHistoryLoadPromise = null;
@@ -174,98 +172,10 @@ function normalizeModelsResponse(result) {
   };
 }
 
-async function readCachedModels() {
-  try {
-    const payload = JSON.parse(await fs.readFile(MODELS_CACHE_FILE, "utf8"));
-    const data = (payload.models || [])
-      .filter((model) => model?.visibility !== "hide" && model?.supported_in_api !== false)
-      .map(normalizeModel)
-      .filter(Boolean);
-    if (data.length === 0) return null;
-    return {
-      data,
-      nextCursor: null,
-      source: "local-cache",
-      cachedAt: payload.fetched_at || null,
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function readCliModelDefaults() {
-  try {
-    const source = await fs.readFile(config.codexConfigPath, "utf8");
-    let section = "";
-    let model = null;
-    let effort = null;
-    for (const rawLine of source.split("\n")) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith("#")) continue;
-      const sectionMatch = line.match(/^\[([^\]]+)\]$/);
-      if (sectionMatch) {
-        section = sectionMatch[1];
-        continue;
-      }
-      if (section) continue;
-      const valueMatch = line.match(/^([A-Za-z0-9_]+)\s*=\s*["']([^"']+)["']/);
-      if (!valueMatch) continue;
-      if (valueMatch[1] === "model") model = valueMatch[2].trim();
-      if (valueMatch[1] === "model_reasoning_effort") effort = valueMatch[2].trim();
-    }
-    return { model, effort };
-  } catch {
-    return { model: null, effort: null };
-  }
-}
-
-async function applyCliModelDefaults(response) {
-  const configured = await readCliModelDefaults();
-  if (!configured.model) return response;
-  const data = [...(response?.data || [])];
-  const index = data.findIndex((model) => (model.id || model.model) === configured.model);
-  if (index >= 0) {
-    data[index] = {
-      ...data[index],
-      isDefault: true,
-      defaultReasoningEffort: configured.effort || data[index].defaultReasoningEffort || null,
-    };
-  } else {
-    data.unshift(normalizeModel({
-      id: configured.model,
-      model: configured.model,
-      displayName: configured.model,
-      isDefault: true,
-      defaultReasoningEffort: configured.effort,
-      supportedReasoningEfforts: configured.effort ? [configured.effort] : [],
-    }));
-  }
-  return {
-    ...response,
-    data: data.map((model) => ({
-      ...model,
-      isDefault: (model.id || model.model) === configured.model,
-    })),
-    configuredModel: configured.model,
-    configuredReasoningEffort: configured.effort,
-    source: "codex-cli",
-  };
-}
-
 async function listModels() {
-  if (!client.socket || client.socket.closed) {
-    const cached = await readCachedModels();
-    if (cached) return applyCliModelDefaults(cached);
-  }
-  try {
-    return applyCliModelDefaults(normalizeModelsResponse(
-      await client.request("model/list", { limit: 100 }),
-    ));
-  } catch (error) {
-    const cached = await readCachedModels();
-    if (cached) return applyCliModelDefaults(cached);
-    throw error;
-  }
+  return normalizeModelsResponse(
+    await client.request("model/list", { limit: 100 }),
+  );
 }
 
 function json(res, status, body) {
@@ -1289,7 +1199,7 @@ async function handle(req, res, url) {
     return json(res, 201, { thread, turn });
   }
 
-  const threadMatch = url.pathname.match(/^\/api\/threads\/([^/]+)(?:\/(message|stop|archive|fork))?$/);
+  const threadMatch = url.pathname.match(/^\/api\/threads\/([^/]+)(?:\/(message|steer|stop|archive|fork))?$/);
   if (threadMatch) {
     const threadId = decodeURIComponent(threadMatch[1]);
     const action = threadMatch[2];
@@ -1328,6 +1238,28 @@ async function handle(req, res, url) {
       }
       scheduleThreadSync("message-sent", 100);
       return json(res, 202, { thread, turn });
+    }
+    if (req.method === "POST" && action === "steer") {
+      if (usesWindowsCliFallback()) {
+        const error = new Error("Codex turn steering is not supported by the Windows CLI fallback");
+        error.status = 501;
+        throw error;
+      }
+      const data = await body(req);
+      const { turnId, source, thread } = await resolveActiveTurn(threadId);
+      if (!turnId) {
+        const status = thread?.status?.type ? ` (${thread.status.type})` : "";
+        const error = new Error(`No active turn for this thread${status}`);
+        error.status = 409;
+        throw error;
+      }
+      const result = await client.request("turn/steer", {
+        threadId,
+        input: await inputFrom(data),
+        expectedTurnId: turnId,
+      });
+      scheduleThreadSync("turn-steered", 100);
+      return json(res, 202, { thread, turn: result, turnId, source });
     }
     if (req.method === "POST" && action === "fork") {
       if (usesWindowsCliFallback()) {

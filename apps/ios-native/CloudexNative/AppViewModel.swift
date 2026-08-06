@@ -11,13 +11,18 @@ final class AppViewModel: ObservableObject {
     @Published var selectedModelID: String
     @Published var selectedEffortID: String
     @Published var codexMode: CodexExecutionMode
+    @Published private(set) var pinnedThreadIDs: Set<String>
     @Published var projects: [CloudexProject] = []
     @Published var renderedMessages: [ChatMessage] = []
     @Published var models: [CodexModel] = []
     @Published var selectedProjectCWD: String?
     @Published var selectedThreadID: String?
     @Published var detail: ThreadDetail? { didSet { rebuildRenderedMessages() } }
-    @Published var draft = ""
+    @Published var draft = "" {
+        didSet {
+            UserDefaults.standard.set(draft, forKey: "cloudex.draft")
+        }
+    }
     @Published var status = "未连接"
     @Published var isServerReachable = false
     @Published var isBusy = false
@@ -84,9 +89,11 @@ final class AppViewModel: ObservableObject {
         // selection still applies for the current run and subsequent turns.
         selectedModelID = ""
         selectedEffortID = defaults.string(forKey: "cloudex.effort") ?? ""
+        draft = defaults.string(forKey: "cloudex.draft") ?? ""
         codexMode = CodexExecutionMode(
             rawValue: defaults.string(forKey: "cloudex.codexMode") ?? ""
         ) ?? .requestApproval
+        pinnedThreadIDs = Set(defaults.stringArray(forKey: "cloudex.pinnedThreadIDs") ?? [])
         notifyApprovals = defaults.object(forKey: "cloudex.notifyApprovals") as? Bool ?? true
         notifyTaskSuccess = defaults.object(forKey: "cloudex.notifyTaskSuccess") as? Bool ?? true
         notifyTaskFailure = defaults.object(forKey: "cloudex.notifyTaskFailure") as? Bool ?? true
@@ -1058,10 +1065,11 @@ final class AppViewModel: ObservableObject {
                 models = visibleModels
                 modelsLoaded = true
                 if normalizedURL(serverURL) != candidate { serverURL = candidate }
-                if selectedModelID.isEmpty {
-                    selectedModelID = visibleModels.first(where: { $0.isDefault == true })?.identifier
-                        ?? visibleModels.first?.identifier
-                        ?? ""
+                let fallbackModelID = visibleModels.first(where: { $0.isDefault == true })?.identifier
+                    ?? visibleModels.first?.identifier
+                    ?? ""
+                if !visibleModels.contains(where: { $0.identifier == selectedModelID }) {
+                    selectedModelID = fallbackModelID
                 }
                 normalizeEffortForSelectedModel()
                 return
@@ -1138,9 +1146,13 @@ final class AppViewModel: ObservableObject {
         localError = nil
         attachedFiles = []
         detail = ThreadDetail(thread: thread, turns: [])
-        if let model = thread.model?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
-            selectedModelID = model
-        }
+        // Do not carry the previous conversation's model into this one while
+        // the authoritative Codex model list is being refreshed.
+        selectedModelID = ""
+        selectedEffortID = ""
+        await refreshModelsForConversation()
+        guard selectedThreadID == thread.id else { return }
+        applyConversationModel(thread.model)
         liveRunning = thread.isActive
         messageIndex = []
         let cache = conversationCache
@@ -1150,9 +1162,7 @@ final class AppViewModel: ObservableObject {
         guard selectedThreadID == thread.id else { return }
         if let cachedDetail {
             detail = cachedDetail
-            if let model = cachedDetail.thread.model?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
-                selectedModelID = model
-            }
+            applyConversationModel(cachedDetail.thread.model)
             liveRunning = cachedDetail.thread.isActive
         }
         let cachedIndex = await Task.detached(priority: .utility) {
@@ -1168,6 +1178,30 @@ final class AppViewModel: ObservableObject {
             pollTask?.cancel()
             pollTask = nil
         }
+    }
+
+    private func refreshModelsForConversation() async {
+        while modelsLoading {
+            try? await Task.sleep(for: .milliseconds(20))
+            if Task.isCancelled { return }
+        }
+        await loadModelsIfNeeded(force: true)
+    }
+
+    private func applyConversationModel(_ modelValue: String?) {
+        guard let model = modelValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty,
+              models.contains(where: { $0.identifier == model }) else {
+            if !models.contains(where: { $0.identifier == selectedModelID }) {
+                selectedModelID = models.first(where: { $0.isDefault == true })?.identifier
+                    ?? models.first?.identifier
+                    ?? ""
+            }
+            normalizeEffortForSelectedModel()
+            return
+        }
+        selectedModelID = model
+        normalizeEffortForSelectedModel()
     }
 
     func startNewChat(projectCWD: String? = nil) {
@@ -1301,6 +1335,7 @@ final class AppViewModel: ObservableObject {
     func send() async {
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return }
+        let wasRunning = active
         isBusy = true
         liveRunning = true
         clearLiveMessages()
@@ -1313,7 +1348,8 @@ final class AppViewModel: ObservableObject {
         do {
             if let selectedThreadID {
                 body["message"] = prompt
-                let _: EmptyResponse = try await client.post(client.threadPath(selectedThreadID, action: "message"), json: body)
+                let action = wasRunning ? "steer" : "message"
+                let _: EmptyResponse = try await client.post(client.threadPath(selectedThreadID, action: action), json: body)
                 draft = ""
                 attachedFiles = []
                 await loadThread(selectedThreadID)
@@ -1331,7 +1367,7 @@ final class AppViewModel: ObservableObject {
                 await refresh()
             }
         } catch {
-            liveRunning = false
+            liveRunning = wasRunning
             localError = error.localizedDescription
             status = "发送失败：\(error.localizedDescription)"
         }
@@ -1517,6 +1553,19 @@ final class AppViewModel: ObservableObject {
     func selectCodexMode(_ mode: CodexExecutionMode) {
         codexMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: "cloudex.codexMode")
+    }
+
+    func isPinned(_ threadID: String) -> Bool {
+        pinnedThreadIDs.contains(threadID)
+    }
+
+    func togglePinned(_ threadID: String) {
+        if pinnedThreadIDs.contains(threadID) {
+            pinnedThreadIDs.remove(threadID)
+        } else {
+            pinnedThreadIDs.insert(threadID)
+        }
+        UserDefaults.standard.set(Array(pinnedThreadIDs).sorted(), forKey: "cloudex.pinnedThreadIDs")
     }
 
     private var codexModePayload: [String: Any] {

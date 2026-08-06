@@ -388,6 +388,15 @@ struct ContentView: View {
                     }
 
                     if content.active {
+                        if !viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            PendingSteerBubble(
+                                text: viewModel.draft,
+                                isSending: viewModel.isBusy,
+                                onSend: { Task { await viewModel.send() } }
+                            )
+                            .id("pending-steer")
+                        }
+
                         ProgressView()
                             .padding(.vertical, 8)
                     }
@@ -1342,6 +1351,61 @@ private struct TokenUsageSheet: View {
     private func usageRow(_ title: String, value: Int?) -> some View {
         if let value {
             LabeledContent(title, value: "\(value.formatted())")
+        }
+    }
+}
+
+private struct PendingSteerBubble: View {
+    let text: String
+    let isSending: Bool
+    let onSend: () -> Void
+
+    var body: some View {
+        HStack(alignment: .bottom) {
+            Spacer(minLength: 42)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("等待发送")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                Text(text)
+                    .font(.body)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+
+                HStack(spacing: 6) {
+                    Spacer(minLength: 10)
+
+                    Button {
+                        UIPasteboard.general.string = text
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                            .frame(width: 28, height: 24)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("复制待发送内容")
+
+                    Button(action: onSend) {
+                        if isSending {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .frame(width: 28, height: 24)
+                        } else {
+                            Image(systemName: "arrow.up")
+                                .frame(width: 28, height: 24)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.blue)
+                    .disabled(isSending)
+                    .accessibilityLabel("发送为引导对话")
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+            .background(Color.blue.opacity(0.14), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         }
     }
 }

@@ -23,6 +23,11 @@ final class AppViewModel: ObservableObject {
             UserDefaults.standard.set(draft, forKey: "cloudex.draft")
         }
     }
+    @Published var pendingSteerDraft = "" {
+        didSet {
+            UserDefaults.standard.set(pendingSteerDraft, forKey: "cloudex.pendingSteerDraft")
+        }
+    }
     @Published var status = "未连接"
     @Published var isServerReachable = false
     @Published var isBusy = false
@@ -59,6 +64,7 @@ final class AppViewModel: ObservableObject {
     private var liveOrderingClock: Double = 0
     private var activeTurnNotificationKeys: [String: String] = [:]
     private var sentTaskResultNotificationKeys = Set<String>()
+    private var pendingSteerAutoSendInFlight = false
 
     init() {
         let defaults = UserDefaults.standard
@@ -90,6 +96,7 @@ final class AppViewModel: ObservableObject {
         selectedModelID = ""
         selectedEffortID = defaults.string(forKey: "cloudex.effort") ?? ""
         draft = defaults.string(forKey: "cloudex.draft") ?? ""
+        pendingSteerDraft = defaults.string(forKey: "cloudex.pendingSteerDraft") ?? ""
         codexMode = CodexExecutionMode(
             rawValue: defaults.string(forKey: "cloudex.codexMode") ?? ""
         ) ?? .requestApproval
@@ -1223,6 +1230,7 @@ final class AppViewModel: ObservableObject {
         if liveRunning && !force { return }
         detailLoadGeneration += 1
         let generation = detailLoadGeneration
+        let wasActive = active
         do {
             let result: ThreadDetail = try await client.get(
                 client.threadPath(threadID),
@@ -1245,6 +1253,9 @@ final class AppViewModel: ObservableObject {
             liveRunning = result.thread.isActive
             if let error = result.turns.last(where: { $0.error != nil })?.error {
                 status = "任务失败：\(error.displayText)"
+            }
+            if wasActive && !active {
+                schedulePendingSteerAutoSend()
             }
         } catch {
             status = "读取会话失败：\(error.localizedDescription)"
@@ -1335,25 +1346,98 @@ final class AppViewModel: ObservableObject {
     func send() async {
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return }
+        guard !active else {
+            queueSteerDraft()
+            return
+        }
+        _ = await submitPrompt(prompt, steering: false)
+    }
+
+    func queueSteerDraft() {
+        let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard active, !prompt.isEmpty else { return }
+        if pendingSteerDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            pendingSteerDraft = draft
+        } else {
+            pendingSteerDraft += "\n\n\(draft)"
+        }
+        draft = ""
+    }
+
+    func editPendingSteer() {
+        let prompt = pendingSteerDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { return }
+        pendingSteerDraft = ""
+        if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            draft = prompt
+        } else {
+            draft += "\n\n\(prompt)"
+        }
+    }
+
+    func deletePendingSteer() {
+        pendingSteerDraft = ""
+    }
+
+    func sendPendingSteer() async {
+        let prompt = pendingSteerDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { return }
+        let steering = active
+        guard await submitPrompt(prompt, steering: steering) else { return }
+        if pendingSteerDraft.trimmingCharacters(in: .whitespacesAndNewlines) == prompt {
+            pendingSteerDraft = ""
+        }
+    }
+
+    private func schedulePendingSteerAutoSend() {
+        guard !pendingSteerDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !pendingSteerAutoSendInFlight else { return }
+        Task { @MainActor [weak self] in
+            await self?.sendPendingSteerAfterTask()
+        }
+    }
+
+    private func sendPendingSteerAfterTask() async {
+        guard !pendingSteerAutoSendInFlight else { return }
+        let prompt = pendingSteerDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty, !active else { return }
+        pendingSteerAutoSendInFlight = true
+        defer { pendingSteerAutoSendInFlight = false }
+        guard await submitPrompt(prompt, steering: false) else { return }
+        if pendingSteerDraft.trimmingCharacters(in: .whitespacesAndNewlines) == prompt {
+            pendingSteerDraft = ""
+        }
+    }
+
+    private func submitPrompt(_ prompt: String, steering: Bool) async -> Bool {
         let wasRunning = active
         isBusy = true
         liveRunning = true
         clearLiveMessages()
         localError = nil
         var body: [String: Any] = [:]
-        if !selectedModelID.isEmpty { body["model"] = selectedModelID }
-        if !selectedEffortID.isEmpty { body["effort"] = selectedEffortID }
-        body.merge(codexModePayload) { _, new in new }
+        if !steering {
+            if !selectedModelID.isEmpty { body["model"] = selectedModelID }
+            if !selectedEffortID.isEmpty { body["effort"] = selectedEffortID }
+            body.merge(codexModePayload) { _, new in new }
+        }
         if !attachedFiles.isEmpty { body["files"] = attachedFiles.map { ["path": $0.path] } }
         do {
             if let selectedThreadID {
                 body["message"] = prompt
-                let action = wasRunning ? "steer" : "message"
+                let action = steering ? "steer" : "message"
                 let _: EmptyResponse = try await client.post(client.threadPath(selectedThreadID, action: action), json: body)
                 draft = ""
                 attachedFiles = []
                 await loadThread(selectedThreadID)
+                isBusy = false
+                return true
             } else {
+                guard !steering else {
+                    status = "当前没有可引导的任务"
+                    isBusy = false
+                    return false
+                }
                 body["prompt"] = prompt
                 if let selectedProjectCWD { body["cwd"] = selectedProjectCWD }
                 let result: CreateThreadResponse = try await client.post("/api/threads", json: body)
@@ -1365,13 +1449,16 @@ final class AppViewModel: ObservableObject {
                 connectThreadStream(threadID: result.thread.id)
                 startPolling(threadID: result.thread.id)
                 await refresh()
+                isBusy = false
+                return true
             }
         } catch {
             liveRunning = wasRunning
             localError = error.localizedDescription
             status = "发送失败：\(error.localizedDescription)"
+            isBusy = false
+            return false
         }
-        isBusy = false
     }
 
     func forkAssistantMessage(_ message: ChatMessage) async -> Bool {

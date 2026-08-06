@@ -971,14 +971,28 @@ function findActiveTurnId(thread) {
   return null;
 }
 
-async function resolveActiveTurn(threadId) {
+async function resolveActiveTurn(threadId, { refresh = false } = {}) {
   const cachedTurnId = client.getActiveTurn(threadId);
-  if (cachedTurnId) return { turnId: cachedTurnId, source: "cache" };
+  if (cachedTurnId && !refresh) return { turnId: cachedTurnId, source: "cache" };
   const result = await readThreadDetail(threadId);
   const thread = result.thread || result;
   const turnId = findActiveTurnId(thread);
   if (turnId) client.setActiveTurn(threadId, turnId);
-  return { turnId, source: config.historySource === "cli-local" ? "cli-local" : "thread/read", thread };
+  return {
+    turnId: turnId || cachedTurnId,
+    source: turnId ? (config.historySource === "cli-local" ? "cli-local" : "thread/read") : "cache",
+    thread,
+  };
+}
+
+function isStaleTurnError(error) {
+  // A stale expectedTurnId can race with turn completion or a reconnect.
+  // JSON-RPC method-not-found is a different failure and must remain visible.
+  if (error?.error?.code === -32601) return false;
+  const message = String(error?.message || "").toLowerCase();
+  return message.includes("not found")
+    || message.includes("no active turn")
+    || message.includes("expected turn");
 }
 
 async function handle(req, res, url) {
@@ -1246,20 +1260,40 @@ async function handle(req, res, url) {
         throw error;
       }
       const data = await body(req);
-      const { turnId, source, thread } = await resolveActiveTurn(threadId);
-      if (!turnId) {
-        const status = thread?.status?.type ? ` (${thread.status.type})` : "";
+      let resolved = await resolveActiveTurn(threadId, { refresh: true });
+      if (!resolved.turnId) {
+        const status = resolved.thread?.status?.type ? ` (${resolved.thread.status.type})` : "";
         const error = new Error(`No active turn for this thread${status}`);
         error.status = 409;
         throw error;
       }
-      const result = await client.request("turn/steer", {
-        threadId,
-        input: await inputFrom(data),
-        expectedTurnId: turnId,
-      });
+      const input = await inputFrom(data);
+      let result;
+      try {
+        result = await client.request("turn/steer", {
+          threadId,
+          input,
+          expectedTurnId: resolved.turnId,
+        });
+      } catch (error) {
+        if (!isStaleTurnError(error)) throw error;
+        const previousTurnId = resolved.turnId;
+        client.clearActiveTurn(threadId);
+        resolved = await resolveActiveTurn(threadId, { refresh: true });
+        if (!resolved.turnId || resolved.turnId === previousTurnId) throw error;
+        result = await client.request("turn/steer", {
+          threadId,
+          input,
+          expectedTurnId: resolved.turnId,
+        });
+      }
       scheduleThreadSync("turn-steered", 100);
-      return json(res, 202, { thread, turn: result, turnId, source });
+      return json(res, 202, {
+        thread: resolved.thread,
+        turn: result,
+        turnId: resolved.turnId,
+        source: resolved.source,
+      });
     }
     if (req.method === "POST" && action === "fork") {
       if (usesWindowsCliFallback()) {

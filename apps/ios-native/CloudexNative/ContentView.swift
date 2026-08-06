@@ -387,16 +387,23 @@ struct ContentView: View {
                             .transition(.opacity.combined(with: .move(edge: .bottom)))
                     }
 
-                    if content.active {
-                        if !viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            PendingSteerBubble(
-                                text: viewModel.draft,
-                                isSending: viewModel.isBusy,
-                                onSend: { Task { await viewModel.send() } }
-                            )
-                            .id("pending-steer")
-                        }
+                    if !viewModel.pendingSteerDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        PendingSteerBubble(
+                            text: viewModel.pendingSteerDraft,
+                            isSending: viewModel.isBusy,
+                            onEdit: {
+                                viewModel.editPendingSteer()
+                                composerFocused = true
+                            },
+                            onDelete: {
+                                viewModel.deletePendingSteer()
+                            },
+                            onSend: { Task { await viewModel.sendPendingSteer() } }
+                        )
+                        .id("pending-steer")
+                    }
 
+                    if content.active {
                         ProgressView()
                             .padding(.vertical, 8)
                     }
@@ -701,16 +708,30 @@ struct ContentView: View {
                 .padding(.leading, 4)
 
                 if viewModel.active {
-                    Button { Task { await viewModel.stop() } } label: {
-                        Image(systemName: "stop.fill")
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .frame(width: 40, height: 40)
-                            .contentShape(Circle())
+                    if viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Button { Task { await viewModel.stop() } } label: {
+                            Image(systemName: "stop.fill")
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                                .frame(width: 40, height: 40)
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(viewModel.isBusy)
+                        .accessibilityLabel("停止任务")
+                    } else {
+                        Button {
+                            viewModel.queueSteerDraft()
+                        } label: {
+                            Image(systemName: "arrow.up")
+                                .font(.body.bold())
+                                .foregroundStyle(.primary)
+                                .frame(width: 40, height: 40)
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("等待发送")
                     }
-                    .buttonStyle(.plain)
-                    .disabled(viewModel.isBusy)
-                    .accessibilityLabel("停止任务")
                 } else {
                     Button { Task { await viewModel.send() } } label: {
                         Group {
@@ -1358,6 +1379,8 @@ private struct TokenUsageSheet: View {
 private struct PendingSteerBubble: View {
     let text: String
     let isSending: Bool
+    let onEdit: () -> Void
+    let onDelete: () -> Void
     let onSend: () -> Void
 
     var body: some View {
@@ -1378,14 +1401,26 @@ private struct PendingSteerBubble: View {
                     Spacer(minLength: 10)
 
                     Button {
-                        UIPasteboard.general.string = text
+                        onEdit()
                     } label: {
-                        Image(systemName: "doc.on.doc")
+                        Image(systemName: "pencil")
                             .frame(width: 28, height: 24)
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
-                    .accessibilityLabel("复制待发送内容")
+                    .disabled(isSending)
+                    .accessibilityLabel("编辑待发送内容")
+
+                    Button {
+                        onDelete()
+                    } label: {
+                        Image(systemName: "trash")
+                            .frame(width: 28, height: 24)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .disabled(isSending)
+                    .accessibilityLabel("删除待发送内容")
 
                     Button(action: onSend) {
                         if isSending {

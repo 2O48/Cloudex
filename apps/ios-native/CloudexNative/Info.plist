@@ -6,6 +6,22 @@
     <string>$(DEVELOPMENT_LANGUAGE)</string>
     <key>CFBundleDisplayName</key>
     <string>Cloudex</string>
+    <key>CFBundleIconFiles</key>
+    <array>
+        <string>CloudexNotificationIcon</string>
+    </array>
+    <key>CFBundleIcons</key>
+    <dict>
+        <key>CFBundlePrimaryIcon</key>
+        <dict>
+            <key>CFBundleIconFiles</key>
+            <array>
+                <string>CloudexNotificationIcon</string>
+            </array>
+            <key>CFBundleIconIsPrecomposed</key>
+            <true/>
+        </dict>
+    </dict>
     <key>CFBundleExecutable</key>
     <string>$(EXECUTABLE_NAME)</string>
     <key>CFBundleIdentifier</key>

@@ -791,7 +791,8 @@ struct ContentView: View {
                     }
                     .buttonStyle(.plain)
                     .background(Color.black, in: Circle())
-                    .disabled(viewModel.isBusy || viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .opacity(isSendButtonDisabled ? 0.45 : 1)
+                    .disabled(isSendButtonDisabled)
                     .accessibilityLabel("发送消息")
                 }
             }
@@ -810,6 +811,11 @@ struct ContentView: View {
         guard UIDevice.current.userInterfaceIdiom == .pad else { return -7 }
         guard isWindowedIPad else { return 0 }
         return max(0, 24 - bottomSafeArea)
+    }
+
+    private var isSendButtonDisabled: Bool {
+        viewModel.isBusy
+            || viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var isExpectedChatReady: Bool {
@@ -1587,6 +1593,12 @@ private struct MessageBubble: View {
             } message: {
                 Text(previewError ?? cloudexLocalized("未知错误"))
             }
+        } else if message.role == .error {
+            // Errors are status messages like assistant responses: give the
+            // bubble the row's proposed width instead of letting its text
+            // intrinsic size determine the red outline's width.
+            messageContent
+                .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             HStack {
                 if message.role == .user { Spacer(minLength: 42) }
@@ -1617,15 +1629,39 @@ private struct MessageBubble: View {
                         .lineLimit(isErrorExpanded || !canExpandError ? nil : 2)
                 }
             } else {
-                MarkdownText(
-                    text: message.text,
-                    highlightQuery: highlightQuery,
-                    onFileLink: message.role == .assistant ? { url in previewFile(url) } : nil
-                )
-                    .font(.body)
-                    .foregroundStyle(message.role == .error ? Color.red : Color.primary)
-                    .multilineTextAlignment(.leading)
-                    .textSelection(.enabled)
+                if message.role == .user, !message.attachments.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(message.attachments) { attachment in
+                            HStack(spacing: 7) {
+                                Image(systemName: attachment.systemImage)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                Text(attachment.name)
+                                    .font(.caption.weight(.medium))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 7)
+                            .background(Color(.systemGray6), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        }
+                    }
+                    .padding(.bottom, message.text.isEmpty ? 0 : 3)
+                }
+
+                if !message.text.isEmpty {
+                    MarkdownText(
+                        text: message.text,
+                        highlightQuery: highlightQuery,
+                        rendersMarkdown: message.role != .user,
+                        onFileLink: message.role == .assistant ? { url in previewFile(url) } : nil
+                    )
+                        .font(.body)
+                        .foregroundStyle(message.role == .error ? Color.red : Color.primary)
+                        .multilineTextAlignment(.leading)
+                        .textSelection(.enabled)
+                }
             }
 
             if message.role == .assistant,
@@ -1639,6 +1675,10 @@ private struct MessageBubble: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 11)
+        .frame(
+            maxWidth: message.role == .assistant || message.role == .error ? .infinity : nil,
+            alignment: .leading
+        )
         .background(message.role == .user ? bubbleColor : .clear,
                     in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay {
@@ -1656,35 +1696,77 @@ private struct MessageBubble: View {
         guard url.scheme == nil || url.isFileURL else { return }
         guard previewLoadingPath == nil else { return }
 
-        var path = (url.isFileURL ? url.path : (url.path.isEmpty ? url.absoluteString : url.path))
+        let candidates = previewPathCandidates(for: url)
+        guard let firstCandidate = candidates.first else { return }
+        previewLoadingPath = firstCandidate
+        Task {
+            var lastError: Error?
+            for path in candidates {
+                do {
+                    let data = try await viewModel.previewFile(path: path)
+                    let name = (path as NSString).lastPathComponent
+                    let directory = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("CloudexPreviews", isDirectory: true)
+                        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    let localURL = directory.appendingPathComponent(name)
+                    try data.write(to: localURL, options: .atomic)
+                    previewItem = EditPreviewItem(
+                        name: name,
+                        url: localURL,
+                        code: CodePreviewFile.supports(fileName: name) ? CodePreviewFile.decode(data) : nil
+                    )
+                    previewLoadingPath = nil
+                    return
+                } catch {
+                    lastError = error
+                }
+            }
+            previewError = lastError?.localizedDescription ?? cloudexLocalized("未知错误")
+            previewLoadingPath = nil
+        }
+    }
+
+    private func previewPathCandidates(for url: URL) -> [String] {
+        let rawPath = (url.isFileURL ? url.path : (url.path.isEmpty ? url.absoluteString : url.path))
             .removingPercentEncoding ?? url.absoluteString
-        if !path.hasPrefix("/"), let root = viewModel.selectedProjectCWD ?? viewModel.selectedThread?.cwd,
-           !root.isEmpty {
-            path = URL(fileURLWithPath: root, isDirectory: true)
-                .appendingPathComponent(path)
-                .path
+        let normalizedPath = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedPath.isEmpty else { return [] }
+
+        let root = viewModel.selectedThread?.cwd ?? viewModel.selectedProjectCWD
+        let linkedName = (normalizedPath as NSString).lastPathComponent
+        let comparisonPath = normalizedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        var knownPaths = message.editDiff?.map(\.name) ?? []
+        knownPaths.append(contentsOf: (viewModel.detail?.turns ?? []).flatMap { turn in
+            (turn.items ?? []).flatMap { $0.diff?.map(\.name) ?? [] }
+        })
+
+        let matchingPaths = knownPaths.filter { candidate in
+            let normalizedCandidate = candidate.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            return normalizedCandidate == comparisonPath
+                || (normalizedCandidate as NSString).lastPathComponent == linkedName
         }
 
-        previewLoadingPath = path
-        Task {
-            do {
-                let data = try await viewModel.previewFile(path: path)
-                let name = (path as NSString).lastPathComponent
-                let directory = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("CloudexPreviews", isDirectory: true)
-                    .appendingPathComponent(UUID().uuidString, isDirectory: true)
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                let localURL = directory.appendingPathComponent(name)
-                try data.write(to: localURL, options: .atomic)
-                previewItem = EditPreviewItem(
-                    name: name,
-                    url: localURL,
-                    code: CodePreviewFile.supports(fileName: name) ? CodePreviewFile.decode(data) : nil
-                )
-            } catch {
-                previewError = error.localizedDescription
-            }
-            previewLoadingPath = nil
+        func resolveAgainstRoot(_ path: String) -> String {
+            guard !path.hasPrefix("/"), let root, !root.isEmpty else { return path }
+            return URL(fileURLWithPath: root, isDirectory: true)
+                .appendingPathComponent(path)
+                .standardizedFileURL.path
+        }
+
+        var candidates = matchingPaths.map(resolveAgainstRoot)
+        candidates.append(resolveAgainstRoot(normalizedPath))
+        // Some summaries use a workspace-relative path beginning with `/`.
+        // Try it as written first, then as a path beneath the active thread.
+        if normalizedPath.hasPrefix("/"), let root, !root.isEmpty {
+            candidates.append(
+                URL(fileURLWithPath: root, isDirectory: true)
+                    .appendingPathComponent(String(normalizedPath.dropFirst()))
+                    .standardizedFileURL.path
+            )
+        }
+        return candidates.reduce(into: [String]()) { result, candidate in
+            if !result.contains(candidate) { result.append(candidate) }
         }
     }
 
@@ -1725,7 +1807,7 @@ private struct MessageBubble: View {
                     }
                 } label: {
                     Image(systemName: isErrorExpanded ? "chevron.up" : "chevron.down")
-                        .frame(width: 28, height: 24)
+                        .footerHitTarget()
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
@@ -1737,7 +1819,7 @@ private struct MessageBubble: View {
                     UIPasteboard.general.string = message.text
                 } label: {
                     Image(systemName: "doc.on.doc")
-                        .frame(width: 28, height: 24)
+                        .footerHitTarget()
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
@@ -1748,7 +1830,7 @@ private struct MessageBubble: View {
                         onQuickFill(message.text)
                     } label: {
                         Image(systemName: "arrow.down.to.line")
-                            .frame(width: 28, height: 24)
+                            .footerHitTarget()
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
@@ -1764,10 +1846,10 @@ private struct MessageBubble: View {
                     } label: {
                         if isPerformingAction {
                             ProgressView().controlSize(.mini)
-                                .frame(width: 28, height: 24)
+                                .footerHitTarget()
                         } else {
                             Image(systemName: "arrow.triangle.branch")
-                                .frame(width: 28, height: 24)
+                                .footerHitTarget()
                         }
                     }
                     .buttonStyle(.plain)
@@ -1778,6 +1860,17 @@ private struct MessageBubble: View {
             }
         }
         .font(.caption)
+    }
+}
+
+private extension View {
+    // Keep the footer's visual/layout size compact while retaining a larger
+    // transparent hit target for the small action icons.
+    func footerHitTarget() -> some View {
+        frame(width: 28, height: 24)
+            .padding(10)
+            .contentShape(Rectangle())
+            .padding(-10)
     }
 }
 
@@ -1959,7 +2052,9 @@ private struct EditSummaryCard: View {
     }
 
     private var fileNames: String {
-        let names = payloads.map { displayName($0.name) }
+        let names = payloads.map { displayName($0.name) }.reduce(into: [String]()) { result, name in
+            if !result.contains(name) { result.append(name) }
+        }
         if names.count <= 3 { return names.joined(separator: ", ") }
         return "\(names.prefix(3).joined(separator: ", ")) + \(names.count - 3)"
     }
@@ -2156,33 +2251,41 @@ private struct SystemTimelineBubble: View {
 private struct MarkdownText: View {
     let text: String
     var highlightQuery: String? = nil
+    var rendersMarkdown = true
     var onFileLink: ((URL) -> Void)? = nil
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ForEach(Self.blocks(from: text)) { block in
-                switch block.content {
-                case let .paragraph(value):
-                    Text(Self.parseInline(value, highlightQuery: highlightQuery))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                case let .list(items):
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(items) { item in
-                            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                Text(item.marker)
-                                    .font(.subheadline.weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                                Text(Self.parseInline(item.text, highlightQuery: highlightQuery))
+        Group {
+            if rendersMarkdown {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Self.blocks(from: text)) { block in
+                        switch block.content {
+                        case let .paragraph(value):
+                            Text(Self.parseInline(value, highlightQuery: highlightQuery))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        case let .list(items):
+                            VStack(alignment: .leading, spacing: 4) {
+                                ForEach(items) { item in
+                                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                        Text(item.marker)
+                                            .font(.subheadline.weight(.semibold))
+                                            .foregroundStyle(.secondary)
+                                        Text(Self.parseInline(item.text, highlightQuery: highlightQuery))
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
                                     .frame(maxWidth: .infinity, alignment: .leading)
+                                }
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        case let .code(value, language):
+                            MarkdownCodeBlock(source: value, language: language)
+                        case let .table(rows):
+                            MarkdownTableView(rows: rows, highlightQuery: highlightQuery)
                         }
                     }
-                case let .code(value, language):
-                    MarkdownCodeBlock(source: value, language: language)
-                case let .table(rows):
-                    MarkdownTableView(rows: rows, highlightQuery: highlightQuery)
                 }
+            } else {
+                Text(Self.parsePlainText(text, highlightQuery: highlightQuery))
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .fixedSize(horizontal: false, vertical: true)
@@ -2196,6 +2299,15 @@ private struct MarkdownText: View {
     private static func parseInline(_ text: String, highlightQuery: String?) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
         let parsed = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        return highlightedAttributedString(markdownInlineCodeBackground(parsed), query: highlightQuery)
+    }
+
+    private static func parsePlainText(_ text: String, highlightQuery: String?) -> AttributedString {
+        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        var parsed = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        for run in parsed.runs {
+            parsed[run.range].inlinePresentationIntent = nil
+        }
         return highlightedAttributedString(parsed, query: highlightQuery)
     }
 
@@ -2439,16 +2551,41 @@ private struct MarkdownListItem: Identifiable {
 private struct MarkdownCodeBlock: View {
     let source: String
     let language: String
+    @State private var didCopy = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if !language.isEmpty {
-                Text(language.lowercased())
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.top, 8)
+            HStack(spacing: 8) {
+                if !language.isEmpty {
+                    Text(language.lowercased())
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 8)
+
+                Button {
+                    UIPasteboard.general.string = source
+                    withAnimation(.easeInOut(duration: 0.16)) {
+                        didCopy = true
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                        withAnimation(.easeInOut(duration: 0.16)) {
+                            didCopy = false
+                        }
+                    }
+                } label: {
+                    Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+                        .font(.caption.weight(.semibold))
+                        .frame(width: 28, height: 24)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(didCopy ? "已复制" : "复制代码")
             }
+            .padding(.horizontal, 8)
+            .padding(.top, 6)
+            .padding(.bottom, 2)
 
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(source.isEmpty ? " " : source)
@@ -2461,7 +2598,7 @@ private struct MarkdownCodeBlock: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(Color(.systemGray6), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 }
 
@@ -2502,7 +2639,7 @@ private struct MarkdownTableView: View {
     private func inlineText(_ value: String) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
         let parsed = (try? AttributedString(markdown: value, options: options)) ?? AttributedString(value)
-        return highlightedAttributedString(parsed, query: highlightQuery)
+        return highlightedAttributedString(markdownInlineCodeBackground(parsed), query: highlightQuery)
     }
 }
 
@@ -2680,7 +2817,7 @@ private struct CodexStyleDiffRenderer: View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(files) { file in
                 VStack(alignment: .leading, spacing: 0) {
-                    if payloads.count > 1 {
+                    if files.count > 1 {
                         HStack(alignment: .firstTextBaseline) {
                             Text(file.displayName)
                                 .font(.caption2.weight(.semibold))
@@ -2720,8 +2857,25 @@ private struct CodexStyleDiffRenderer: View {
     }
 
     private var files: [DiffFile] {
-        payloads.enumerated().map { index, payload in
-            DiffFile(oldPath: displayName(payload.name), newPath: displayName(payload.name), hunks: [hunk(from: payload, index: index)])
+        var groups: [(path: String, payloads: [(Int, EditDiffPayload)])] = []
+        var indexes: [String: Int] = [:]
+
+        for (index, payload) in payloads.enumerated() {
+            let path = payload.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let groupIndex = indexes[path] {
+                groups[groupIndex].payloads.append((index, payload))
+            } else {
+                indexes[path] = groups.count
+                groups.append((path: path, payloads: [(index, payload)]))
+            }
+        }
+
+        return groups.map { group in
+            DiffFile(
+                oldPath: displayName(group.path),
+                newPath: displayName(group.path),
+                hunks: group.payloads.map { hunk(from: $0.1, index: $0.0) }
+            )
         }
     }
 

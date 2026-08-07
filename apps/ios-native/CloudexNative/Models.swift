@@ -53,6 +53,15 @@ func highlightedAttributedString(_ source: AttributedString, query: String?) -> 
     return result
 }
 
+func markdownInlineCodeBackground(_ source: AttributedString) -> AttributedString {
+    var result = source
+    for run in result.runs {
+        guard run.inlinePresentationIntent?.contains(.code) == true else { continue }
+        result[run.range].backgroundColor = Color(.systemGray5)
+    }
+    return result
+}
+
 func cloudexLocalized(_ key: String) -> String {
     NSLocalizedString(key, bundle: .main, value: key, comment: "")
 }
@@ -498,6 +507,11 @@ struct TurnContent: Codable, Equatable {
     let type: String?
     let text: String?
     let value: String?
+    let path: String?
+    let name: String?
+    let filename: String?
+    let mimeType: String?
+    let url: String?
 }
 
 struct TurnErrorPayload: Codable, Equatable {
@@ -728,6 +742,20 @@ struct RemoteFileEntry: Codable, Identifiable, Hashable {
     var isDirectory: Bool { type == "directory" }
 }
 
+struct MessageAttachment: Identifiable, Equatable {
+    enum Kind: String, Equatable {
+        case image
+        case file
+    }
+
+    let name: String
+    let path: String?
+    let kind: Kind
+
+    var id: String { "\(kind.rawValue):\(path ?? name)" }
+    var systemImage: String { kind == .image ? "photo" : "doc" }
+}
+
 struct ChatMessage: Identifiable, Equatable {
     enum Role: String {
         case user
@@ -755,6 +783,7 @@ struct ChatMessage: Identifiable, Equatable {
     var sourceTurnID: String? = nil
     var processItemCount: Int? = nil
     var processDetailsLoaded: Bool = true
+    var attachments: [MessageAttachment] = []
 }
 
 struct SSEEvent {

@@ -1,10 +1,52 @@
 import crypto from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFile as execFileCallback, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
+import fs from "node:fs/promises";
+import { promisify } from "node:util";
 import { config } from "./config.js";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const execFile = promisify(execFileCallback);
+
+async function waitForControlSocket(timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await fs.access(config.controlSocketPath);
+      return;
+    } catch {
+      await sleep(100);
+    }
+  }
+  throw new Error(`Codex app-server control socket was not created: ${config.controlSocketPath}`);
+}
+
+async function bootstrapManagedAppServer() {
+  // Windows intentionally keeps the existing CLI fallback. Its app-server
+  // daemon is not required for starting turns or listing models there.
+  if (process.platform === "win32") return;
+
+  try {
+    await execFile(config.codexBin, ["app-server", "daemon", "bootstrap"], {
+      env: process.env,
+      timeout: 15_000,
+      windowsHide: true,
+    });
+  } catch (error) {
+    const output = [error.stdout, error.stderr, error.message]
+      .filter(Boolean)
+      .map((value) => String(value))
+      .join("\n");
+    // Codex reports this as a non-zero result when an unmanaged app-server is
+    // already running. The proxy can still connect to that existing daemon.
+    if (!output.includes("app server is running but is not managed by codex app-server daemon")) {
+      throw error;
+    }
+  }
+  await waitForControlSocket();
 }
 
 export class CodexError extends Error {
@@ -189,6 +231,7 @@ export class CodexClient extends EventEmitter {
   }
 
   async connectWithRetry() {
+    await bootstrapManagedAppServer();
     let lastError;
     for (let attempt = 0; attempt < 30; attempt += 1) {
       try {

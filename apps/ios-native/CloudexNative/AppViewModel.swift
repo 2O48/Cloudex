@@ -310,15 +310,108 @@ final class AppViewModel: ObservableObject {
         }
         guard item.type == "userMessage" || item.type == "agentMessage" else { return nil }
         if item.type == "agentMessage", shouldHidePersistedLiveMessage(item, turnID: turnID) { return nil }
-        let text = item.renderedText
-        guard !text.isEmpty else { return nil }
+        let presentation = item.type == "userMessage"
+            ? userMessagePresentation(for: item)
+            : (text: item.renderedText, attachments: [MessageAttachment]())
+        guard !presentation.text.isEmpty || !presentation.attachments.isEmpty else { return nil }
         return ChatMessage(
             id: item.id ?? "\(turnID)-\(item.type)-\(fallbackIndex)",
             role: item.type == "userMessage" ? .user : .assistant,
-            text: text,
+            text: presentation.text,
             createdAt: item.createdAt,
-            sourceTurnID: turnID
+            sourceTurnID: turnID,
+            attachments: presentation.attachments
         )
+    }
+
+    private func userMessagePresentation(for item: TurnItem) -> (text: String, attachments: [MessageAttachment]) {
+        let source = item.renderedText
+        var attachments: [MessageAttachment] = []
+
+        func appendAttachment(name: String?, path: String?, image: Bool) {
+            let trimmedPath = path?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let fileName = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedName: String = {
+                if let fileName, !fileName.isEmpty { return fileName }
+                guard let trimmedPath, !trimmedPath.isEmpty else { return image ? "图片" : "文件" }
+                if let url = URL(string: trimmedPath), url.isFileURL, !url.lastPathComponent.isEmpty {
+                    return url.lastPathComponent
+                }
+                let lastPathComponent = (trimmedPath as NSString).lastPathComponent
+                return lastPathComponent.isEmpty ? trimmedPath : lastPathComponent
+            }()
+            let kind: MessageAttachment.Kind = image || Self.isImagePath(trimmedPath ?? resolvedName) ? .image : .file
+            let attachment = MessageAttachment(name: resolvedName, path: trimmedPath, kind: kind)
+            guard !attachments.contains(where: { $0.id == attachment.id }) else { return }
+            attachments.append(attachment)
+        }
+
+        for part in item.content ?? [] {
+            let type = (part.type ?? "").lowercased()
+            let candidate = part.path ?? part.url
+            let isImage = type.contains("image") || (part.mimeType?.lowercased().hasPrefix("image/") ?? false)
+            let isFile = type.contains("file") || type.contains("document") || candidate != nil
+            if isImage || isFile {
+                appendAttachment(name: part.name ?? part.filename, path: candidate, image: isImage)
+            }
+        }
+
+        for match in Self.captureMatches(in: source, pattern: #"\[Attached local file:\s*([^\]]+)\]"#) {
+            appendAttachment(name: nil, path: match, image: false)
+        }
+        for match in Self.captureMatches(in: source, pattern: #"(?m)^\s*##\s*(.+?)\s*:\s*((?:/|~|[A-Za-z]:[\\/]).+?)\s*$"#, group: 2) {
+            appendAttachment(name: nil, path: match, image: false)
+        }
+        for match in Self.captureMatches(in: source, pattern: #"<image\b[^>]*\bpath=\"([^\"]+)\"[^>]*>"#) {
+            appendAttachment(name: nil, path: match, image: true)
+        }
+
+        var text = source
+        for tag in ["in-app-browser-context", "browser-context", "environment_context", "app-context", "skills_instructions", "permissions instructions", "collaboration_mode"] {
+            let escaped = NSRegularExpression.escapedPattern(for: tag)
+            text = text.replacingOccurrences(
+                of: "(?is)<\(escaped)\\b[^>]*>.*?</\(escaped)\\s*>",
+                with: "",
+                options: .regularExpression
+            )
+        }
+        text = text.replacingOccurrences(of: #"\[Attached local file:\s*[^\]]+\]"#, with: "", options: .regularExpression)
+        text = text.replacingOccurrences(of: #"(?m)^\s*<image\b[^>]*>\s*$"#, with: "", options: .regularExpression)
+
+        let visibleLines = text.components(separatedBy: .newlines).filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return true }
+            if trimmed.range(of: #"^#*\s*files mentioned by (?:the )?user\s*:?$"#, options: [.regularExpression, .caseInsensitive]) != nil {
+                return false
+            }
+            if trimmed.range(of: #"^#*\s*my request(?: for codex)?\s*[:：]?$"#, options: [.regularExpression, .caseInsensitive]) != nil {
+                return false
+            }
+            if trimmed.range(of: #"^##\s*.+?\s*:\s*(?:/|~|[A-Za-z]:[\\/]).+$"#, options: .regularExpression) != nil {
+                return false
+            }
+            return !trimmed.localizedCaseInsensitiveContains("in-app-browser-context")
+        }
+
+        text = visibleLines.joined(separator: "\n")
+            .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (text, attachments)
+    }
+
+    private static func captureMatches(in source: String, pattern: String, group: Int = 1) -> [String] {
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(source.startIndex..., in: source)
+        return expression.matches(in: source, range: range).compactMap { match in
+            guard match.numberOfRanges > group,
+                  let range = Range(match.range(at: group), in: source) else { return nil }
+            return String(source[range])
+        }
+    }
+
+    private static func isImagePath(_ value: String) -> Bool {
+        ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tiff"]
+            .contains((value as NSString).pathExtension.lowercased())
     }
 
     private func taskDurationMessage(for turn: CloudexTurn) -> ChatMessage? {

@@ -86,7 +86,9 @@ The server listens on `0.0.0.0:8890` by default. On startup it prints the phone 
 ```bash
 cloudex pair                # print the pairing QR code and server address
 cloudex about               # inspect local environment, Codex CLI, and server status
-cloudex serve --port 8890   # start the server on an explicit port
+cloudex serve --port 8890   # start the server in the background
+cloudex stop                 # stop the background server
+cloudex serve --foreground   # run in the foreground; Ctrl+C stops it
 cloudex --help
 ```
 
@@ -150,6 +152,8 @@ npm install
 npm test                # run server unit tests (node --test)
 npm run server:dev      # hot-reload the server with --watch
 npm run cli -- --help   # run the CLI directly
+npx cloudex serve        # start in the background; the terminal can be closed
+npx cloudex stop         # stop the background server
 npm run pack:server     # produce cloudex-<version>.tgz for npx distribution
 ```
 

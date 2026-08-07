@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { listModelsViaStdio } from "../src/app-server-stdio.js";
 import { readCliThread } from "../src/cli-sessions.js";
+import { daemonPaths, isProcessRunning, readPidRecord } from "../src/daemon.js";
 import { isPathInside, normalizeAllowedPath } from "../src/file-roots.js";
 
 test("project has a package and a safe default workspace root", async () => {
@@ -25,6 +27,46 @@ test("file root checks allow project descendants but reject sibling projects", (
     () => normalizeAllowedPath(sibling, { defaultPath: root, roots: [root] }),
     (error) => error.status === 403,
   );
+});
+
+test("daemon state uses a PID file and detects the current process", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudex-daemon-"));
+  try {
+    const paths = daemonPaths(directory);
+    assert.equal(paths.pidFile, path.join(directory, "server.pid"));
+    assert.equal(isProcessRunning(process.pid), true);
+    assert.equal(await readPidRecord(paths.pidFile), null);
+    await fs.writeFile(paths.pidFile, JSON.stringify({ pid: process.pid, startedAt: "test" }));
+    assert.deepEqual(await readPidRecord(paths.pidFile), { pid: process.pid, startedAt: "test" });
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("stdio app-server model fallback performs initialize and model/list", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudex-model-server-"));
+  const scriptPath = path.join(directory, "fake-app-server.mjs");
+  const script = [
+    'import readline from "node:readline";',
+    'const input = readline.createInterface({ input: process.stdin });',
+    'input.on("line", (line) => {',
+    '  const request = JSON.parse(line);',
+    '  if (request.method === "initialize") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }) + "\\n");',
+    '  if (request.method === "model/list") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { data: [{ id: "gpt-test", model: "gpt-test" }] } }) + "\\n");',
+    '});',
+  ].join("\n");
+
+  try {
+    await fs.writeFile(scriptPath, script, "utf8");
+    const result = await listModelsViaStdio({
+      codexBin: process.execPath,
+      commandArgs: [scriptPath],
+      timeoutMs: 3000,
+    });
+    assert.deepEqual(result.data, [{ id: "gpt-test", model: "gpt-test" }]);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("CLI session parser restores commands from JSON-style exec wrappers", async () => {

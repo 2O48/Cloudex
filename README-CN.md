@@ -86,7 +86,9 @@ npx cloudex serve       # 使用打包后的 cloudex 命令
 ```bash
 cloudex pair            # 打印配对二维码与服务器地址
 cloudex about           # 查看本机环境、Codex CLI 与服务器状态
-cloudex serve --port 8890   # 显式指定端口启动
+cloudex serve --port 8890   # 后台启动服务器
+cloudex stop                 # 停止后台服务器
+cloudex serve --foreground   # 前台启动，按 Ctrl+C 停止
 cloudex --help
 ```
 
@@ -150,6 +152,8 @@ npm install
 npm test                # 运行服务器单元测试（node --test）
 npm run server:dev      # 带 --watch 的服务器热重载
 npm run cli -- --help   # 直接运行 CLI
+npx cloudex serve        # 后台启动，可关闭当前终端
+npx cloudex stop         # 停止后台服务器
 npm run pack:server     # 生成 cloudex-<version>.tgz 供 npx 分发
 ```
 

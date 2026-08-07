@@ -212,6 +212,7 @@ export class CodexClient extends EventEmitter {
     this.child = spawn(config.codexBin, ["app-server", "proxy", "--sock", config.controlSocketPath], {
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
+      windowsHide: true,
     });
     this.child.stderr.on("data", (chunk) => this.emit("log", chunk.toString()));
     const socket = new ProxyWebSocket(this.child);

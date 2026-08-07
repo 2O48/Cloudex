@@ -16,6 +16,7 @@ import {
 } from "./windows-cli.js";
 import { printConnectionQRCode } from "./connection-qr.js";
 import { normalizeAllowedPath } from "./file-roots.js";
+import { listModelsViaStdio } from "./app-server-stdio.js";
 
 const client = new CodexClient();
 const execFile = promisify(execFileCallback);
@@ -167,13 +168,19 @@ function usesWindowsCliFallback() {
 }
 
 function normalizeModelsResponse(result) {
+  const data = Array.isArray(result?.data)
+    ? result.data
+    : (Array.isArray(result?.models) ? result.models : []);
   return {
     ...result,
-    data: (result?.data || []).map(normalizeModel).filter(Boolean),
+    data: data.map(normalizeModel).filter(Boolean),
   };
 }
 
 async function listModels() {
+  if (usesWindowsCliFallback()) {
+    return normalizeModelsResponse(await listModelsViaStdio({ codexBin: config.codexBin }));
+  }
   return normalizeModelsResponse(
     await client.request("model/list", { limit: 100 }),
   );

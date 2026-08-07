@@ -9,9 +9,13 @@
 ```bash
 cloudex pair     # 打印手机端连接地址与扫码配对二维码
 cloudex about    # 查看本机环境、Codex CLI 与服务器状态
-cloudex serve    # 启动服务器（同 npm run server）
+cloudex serve    # 后台启动服务器，之后可以关闭当前终端
+cloudex stop     # 停止 cloudex serve 启动的后台服务器
+cloudex serve --foreground  # 前台启动，按 Ctrl+C 停止
 cloudex --help   # 查看全部命令与选项
 ```
+
+后台运行时，PID 文件和标准输出日志保存在 `.cloudex-state/`；可用 `cloudex about` 查看服务器状态。若需要调试启动过程，使用 `cloudex serve --foreground`。
 
 `pair` 和 `serve` 在未设置 `AUTH_TOKEN` 时会复用或生成 `.cloudex-state/auth-token`，与 `start-cloudex.sh` / `start-cloudex.ps1` 行为一致。打包发布前可在本地验证：
 

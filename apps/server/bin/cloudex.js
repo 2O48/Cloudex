@@ -6,6 +6,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import {
+  daemonPaths,
+  isProcessRunning,
+  readPidRecord,
+  removePidFile,
+  startDetachedServer,
+  stopProcess,
+} from "../src/daemon.js";
 
 const execFileAsync = promisify(execFile);
 const packageRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -19,6 +27,7 @@ function usage() {
 
 命令:
   serve | start  启动 Cloudex 服务器（默认 http://0.0.0.0:8890）
+  stop           停止由 cloudex serve 启动的后台服务器
   pair           打印手机端连接地址与扫码配对二维码
   about          查看本机环境、Codex CLI 与服务器状态
   version        显示版本号
@@ -27,6 +36,7 @@ function usage() {
 选项:
   --port <port>  覆盖监听端口（默认读取 PORT，或 8890）
   --host <host>  覆盖监听地址（默认读取 HOST，或 0.0.0.0）
+  --foreground   前台运行 serve，关闭终端会停止服务器
   --json         about 命令输出 JSON，便于脚本使用
   -h, --help     显示帮助
   -v, --version  显示版本号
@@ -44,13 +54,22 @@ function usage() {
 }
 
 function parseArgs(argv) {
-  const result = { command: null, port: null, host: null, json: false, help: false, version: false };
+  const result = {
+    command: null,
+    port: null,
+    host: null,
+    json: false,
+    foreground: false,
+    help: false,
+    version: false,
+  };
   const positionals = [];
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "-h" || arg === "--help") result.help = true;
     else if (arg === "-v" || arg === "--version") result.version = true;
     else if (arg === "--json") result.json = true;
+    else if (arg === "--foreground") result.foreground = true;
     else if (arg === "--port" || arg === "-p") result.port = argv[++index];
     else if (arg.startsWith("--port=")) result.port = arg.slice("--port=".length);
     else if (arg === "--host") result.host = argv[++index];
@@ -153,6 +172,8 @@ async function cmdPair() {
 async function cmdAbout({ json }) {
   const { config } = await import("../src/config.js");
   const authFile = tokenFilePath();
+  const daemon = await readPidRecord(daemonPaths(stateDir()).pidFile);
+  const serverPort = daemon?.port || config.port;
   const info = {
     name: pkg.name,
     version: pkg.version,
@@ -171,8 +192,10 @@ async function cmdAbout({ json }) {
     stateDir: config.stateDir,
     authFile,
     authEnabled: Boolean(process.env.AUTH_TOKEN || fileExists(authFile)),
-    defaultUrl: `http://${config.host}:${config.port}`,
-    serverRunning: await healthCheck(config.port, process.env.AUTH_TOKEN || persistedToken()),
+    defaultUrl: `http://${config.host}:${serverPort}`,
+    daemonPid: daemon?.pid || null,
+    daemonPort: daemon?.port || null,
+    serverRunning: await healthCheck(serverPort, process.env.AUTH_TOKEN || persistedToken()),
   };
 
   if (json) {
@@ -193,20 +216,75 @@ async function cmdAbout({ json }) {
   console.log(`  会话目录     ${info.sessionsDir}${info.sessionsDirExists ? "" : "（不存在）"}`);
   console.log(`  状态目录     ${info.stateDir}`);
   console.log(`  默认地址     ${info.defaultUrl}`);
+  if (info.daemonPid) console.log(`  后台 PID      ${info.daemonPid}`);
   console.log(`  服务器状态   ${info.serverRunning ? "运行中" : "未运行（127.0.0.1 健康检查失败）"}`);
   console.log(`  HTTP 认证    ${info.authEnabled ? "Bearer token 已启用" : "未启用（仅限本机访问）"}`);
 }
 
-async function cmdServe() {
+async function cmdStop() {
+  const paths = daemonPaths(stateDir());
+  const record = await readPidRecord(paths.pidFile);
+  if (!record) {
+    await removePidFile(paths.pidFile);
+    console.log("Cloudex 服务器未运行（没有有效的 PID 文件）。");
+    return;
+  }
+
+  if (!isProcessRunning(record.pid)) {
+    await removePidFile(paths.pidFile);
+    console.log(`Cloudex 服务器已停止（清理过期 PID ${record.pid}）。`);
+    return;
+  }
+
+  const result = await stopProcess(record.pid);
+  await removePidFile(paths.pidFile);
+  if (!result.stopped) throw new Error(`无法停止 Cloudex 服务器（PID ${record.pid}）`);
+  console.log(`Cloudex 服务器已停止（PID ${record.pid}）。`);
+}
+
+async function cmdServe({ foreground }) {
   const auth = await ensureAuthTokenEnv();
   reportAuthSource(auth);
-  console.log("正在启动 Cloudex 服务器；若 Codex app-server 未就绪，会自动重试（最长约 30 秒）后以本地历史模式继续。");
-  const { startServer } = await import("../src/server.js");
-  await startServer();
+
+  if (foreground) {
+    console.log("正在前台启动 Cloudex 服务器；按 Ctrl+C 停止。");
+    const { startServer } = await import("../src/server.js");
+    await startServer();
+    return;
+  }
+
+  const paths = daemonPaths(stateDir());
+  const existing = await readPidRecord(paths.pidFile);
+  if (existing && isProcessRunning(existing.pid)) {
+    throw new Error(`Cloudex 服务器已经在后台运行（PID ${existing.pid}）。使用 cloudex stop 停止。`);
+  }
+  if (existing) await removePidFile(paths.pidFile);
+  if (await healthCheck(Number(process.env.PORT || 8890), process.env.AUTH_TOKEN || persistedToken())) {
+    throw new Error("Cloudex 服务器已经在当前端口运行，但找不到对应的 PID 文件。请先确认运行中的服务来源。");
+  }
+
+  const pid = await startDetachedServer({
+    packageRoot,
+    cwd: process.cwd(),
+    env: {
+      AUTH_TOKEN: process.env.AUTH_TOKEN,
+      CLOUDEX_STATE_DIR: paths.stateDir,
+      CLOUDEX_PID_FILE: paths.pidFile,
+    },
+    paths,
+    metadata: {
+      host: process.env.HOST || "0.0.0.0",
+      port: Number(process.env.PORT || 8890),
+    },
+  });
+  console.log(`Cloudex 服务器已在后台启动（PID ${pid}）。`);
+  console.log(`地址：http://${process.env.HOST || "0.0.0.0"}:${process.env.PORT || 8890}`);
+  console.log(`日志：${paths.stdoutLog} / ${paths.stderrLog}`);
+  console.log("停止：cloudex stop");
 }
 
 async function main() {
-  const { command, port, host, json, help, version } = parseArgs(process.argv.slice(2));
+  const { command, port, host, json, foreground, help, version } = parseArgs(process.argv.slice(2));
   if (port) process.env.PORT = String(port);
   if (host) process.env.HOST = host;
 
@@ -219,7 +297,8 @@ async function main() {
     return;
   }
 
-  if (command === "serve" || command === "start") await cmdServe();
+  if (command === "serve" || command === "start") await cmdServe({ foreground });
+  else if (command === "stop") await cmdStop();
   else if (command === "pair") await cmdPair();
   else if (command === "about") await cmdAbout({ json });
   else {
